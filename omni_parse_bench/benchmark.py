@@ -133,7 +133,6 @@ def recorded(run: Run, page_id: str) -> dict | None:
 def needs(run: Run, page: gold.Page, retry_failed: bool = False) -> frozenset[str]:
     """The outputs the run still lacks for the page: of those the manifest says to predict for it
     (`page.outputs`), what its record doesn't settle (`missing`)."""
-    assert page.outputs is not None, "pages come from manifest(), which fills outputs in"
     return missing(recorded(run, page.page_id), frozenset(page.outputs), retry_failed)
 
 
@@ -238,9 +237,9 @@ def refuse_regrading(run: Run, revision: str, scores: dict[str, list[dict]]) -> 
 @functools.cache
 def manifest(dataset: str) -> tuple[Path, tuple[gold.Page, ...]]:
     """The dataset's folder and its pages, each with what to predict for it, read once per process: from
-    the manifest alone when it says (`gold.pages`), so planning and predicting read no gold file."""
+    the manifest alone (`gold.manifest`), so planning and predicting read no gold file."""
     root = dataset_root(dataset)
-    return root, gold.pages(root)
+    return root, gold.manifest(root)
 
 
 @functools.cache

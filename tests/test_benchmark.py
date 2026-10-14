@@ -60,8 +60,8 @@ def use(monkeypatch, modules: dict[str, types.ModuleType]) -> None:
 
 def dataset(root: pathlib.Path, n: int = 1, blocks: bool = False, outputs: list | None = None,
             extra: dict | None = None) -> str:
-    """A dataset of `n` pages, each with an html test passing on "alpha" (and a blocks test); with
-    `outputs`, the manifest says what to predict for each page, and `extra` adds columns."""
+    """A dataset of `n` pages, each with an html test passing on "alpha" (and a blocks test); the
+    manifest says to predict what the tests read, or `outputs`, and `extra` adds columns."""
     import pyarrow as pa
     import pyarrow.parquet as pq
 
@@ -79,9 +79,9 @@ def dataset(root: pathlib.Path, n: int = 1, blocks: bool = False, outputs: list 
                        "args": {"content": {"text": "alpha", "max_diffs": 0, "place": [[0, 0, 1, 1]]}},
                        "settings": {"kind": "text"}})
         (root / "gold" / f"{pid}.json").write_text(json.dumps({"tests": ts}))
+        wanted = ["html"] + ["blocks"] * blocks if outputs is None else outputs
         rows.append({"page_id": pid, "document": "a", "suite": "a", "doc_path": f"pages/{pid}.pdf",
-                     "gt_path": f"gold/{pid}.json"} | ({"outputs": outputs} if outputs is not None else {})
-                    | (extra or {}))
+                     "gt_path": f"gold/{pid}.json", "outputs": wanted} | (extra or {}))
     pq.write_table(pa.Table.from_pylist(rows), root / "manifest.parquet")
     return str(root)
 
@@ -293,7 +293,7 @@ def test_a_manifest_that_says_what_to_predict_is_planned_without_the_gold(tmp_pa
     calls = []
     use(monkeypatch, {"stub": stub(call=lambda config: calls.append(1) or contract.Call({"html": "alpha"}))})
     data = dataset(tmp_path / "data", n=2, outputs=["html"])
-    assert [p.outputs for p in gold.pages(data)] == [("html",), ("html",)]
+    assert [p.outputs for p in gold.manifest(data)] == [("html",), ("html",)]
     read = []
     real = gold.read
     monkeypatch.setattr(gold, "read", lambda path: read.append(path) or real(path))
@@ -303,11 +303,18 @@ def test_a_manifest_that_says_what_to_predict_is_planned_without_the_gold(tmp_pa
     assert benchmark.grade_all(p, say=QUIET)[p.runs[0].out.name]["pages"] == 2 and read
 
 
-def test_a_manifest_without_outputs_reads_them_from_the_gold(tmp_path):
-    """Every older commit of a dataset stays readable: the column is derived from the tests."""
-    data = dataset(tmp_path / "data", blocks=True)
-    (page,) = gold.pages(data)
-    assert page.outputs == ("blocks", "html")
+def test_a_dataset_from_before_outputs_says_how_to_get_the_current_one(tmp_path):
+    """What this omni-parse-bench meets in a dataset commit made for 0.1.x: the fixes are in the message."""
+    import pyarrow.parquet as pq
+
+    data = dataset(tmp_path / "data")
+    table = pq.read_table(pathlib.Path(data) / "manifest.parquet")
+    pq.write_table(table.drop_columns(["outputs"]), pathlib.Path(data) / "manifest.parquet")
+    with pytest.raises(gold.GoldError, match="from before omni-parse-bench 0.1.2") as e:
+        gold.manifest(data)
+    for fix in ("hf://datasets/datalab-to/omni_parse_bench", "hf download datalab-to/omni_parse_bench",
+                "pip install 'omni-parse-bench==0.1.1'"):
+        assert fix in str(e.value)
 
 
 def test_outputs_out_of_step_with_the_gold_are_refused(tmp_path):
