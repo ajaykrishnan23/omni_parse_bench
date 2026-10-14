@@ -158,8 +158,13 @@ def predicted(run: Run, page_id: str) -> tuple[dict, str] | None:
 
 def needs(run: Run, page: gold.Page, retry_failed: bool = False) -> frozenset[str]:
     """The outputs the run still lacks for the page: of those the manifest says to predict for it
-    (`page.outputs`), what its record doesn't settle (`missing`)."""
-    return missing(recorded(run, page.page_id), frozenset(page.outputs), retry_failed)
+    (`page.outputs`), what its record doesn't settle (`missing`).
+
+    Note: a page whose prediction can't be read counts as having no record, so it is predicted again:
+    grading reads predictions alone, and a record without one would leave the page pending for good.
+    `opb reparse` rebuilds the predictions from the records without a call."""
+    old = recorded(run, page.page_id) if predicted(run, page.page_id) is not None else None
+    return missing(old, frozenset(page.outputs), retry_failed)
 
 
 def record(run: Run, page_id: str, new: dict) -> dict:
@@ -653,11 +658,10 @@ def grade(run: Run, dataset: str, rescore: bool = False, say: Callable[[str], No
     of the dataset the run has a prediction for, whatever `--suites` and `--limit` chose to predict, so
     a smaller invocation never shrinks a run's scores; a page with no prediction is pending, not failed.
     A page's lines are graded again when they aren't `current`: its prediction or the page's tests have
-    changed. A run graded with another gold or scorer is refused
-    (`refuse_regrading`) unless `rescore`, which grades every page again; each line and summary.json
-    say which gold and scorer graded them. Scores are written however grading ends, so an
-    interrupt keeps what was graded. A run that was never prepared is refused: its folder
-    is most likely another one (another option, another --out)."""
+    changed. A run graded with another gold or scorer is refused (`refuse_regrading`) unless `rescore`,
+    which grades every page again; each line and summary.json say which gold and scorer graded them.
+    Scores are written however grading ends, so an interrupt keeps what was graded. A run that was never
+    prepared is refused: its folder is most likely another one (another option, another --out)."""
     if not run.predictions.is_dir():
         raise ValueError(f"no run at {run.out}: {run.provider} with settings {run.options or 'by default'} "
                          "was never prepared there (it has no predictions/). Check --out and --options, or "

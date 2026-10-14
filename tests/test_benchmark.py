@@ -761,3 +761,16 @@ def test_a_folder_that_doesnt_say_what_it_cannot_produce_is_refused(tmp_path):
     (mine / "predictions").mkdir(parents=True)
     with pytest.raises(ValueError, match="--unsupported"):
         benchmark.grade(benchmark.Run("mine", {}, mine), data, say=QUIET)
+
+
+def test_a_page_whose_prediction_is_lost_is_predicted_again_not_left_pending(tmp_path, monkeypatch):
+    """Grading reads predictions alone, so a record without one would never be graded."""
+    calls = []
+    use(monkeypatch, {"stub": stub(call=lambda config: calls.append(1) or contract.Call({"html": "alpha"}))})
+    p = benchmark.plan(["stub"], out=tmp_path / "runs", dataset=dataset(tmp_path / "data"))
+    benchmark.execute(p, say=QUIET)
+    (run,) = p.runs
+    (run.predictions / "a-p0.json").unlink()
+    assert benchmark.owed(p, run) == (1, 1)
+    (s,) = benchmark.execute(p, say=QUIET).values()
+    assert len(calls) == 2 and s["pages"] == 1 and s["pages_pending"] == 0
