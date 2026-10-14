@@ -160,26 +160,35 @@ def test_retry_failed_asks_again_only_what_may_go_otherwise(failure, error, agai
 
 # 4. A run's dataset, gold and timeout.
 
-def test_a_loop_of_ones_own_keeps_a_run_through_its_methods(tmp_path):
-    """start, needs and store: what predict_all does per page, for a loop that predicts elsewhere."""
+def test_a_loop_of_ones_own_keeps_a_run_through_its_functions(tmp_path, monkeypatch):
+    """start, needs, store and record: what predict_all does per page, for a loop that predicts elsewhere."""
+    monkeypatch.setattr(benchmark, "load", lambda d: (tmp_path / "gold-1", (), {}))
+    monkeypatch.setattr(benchmark, "gold_revision", lambda d, root: root.name)
     r = benchmark.Run("tesseract", {}, tmp_path / "run")
-    r.start("some/dataset", "gold-1", 900.0)
+    benchmark.start(r, "some/dataset", 900.0)
     assert json.loads((r.out / "settings.json").read_text())["gold"] == "gold-1"
     want = frozenset({"html", "blocks"})
-    assert r.needs("p1", want, "sha-a") == want
+    assert benchmark.needs(r, "p1", want, "sha-a") == want
     call = {"outputs": ["html", "blocks"], "usd": 0, "wall_s": 1.0}
     first = {"outputs": {"html": "<p>a</p>", "blocks": None}, "calls": [call], "raw": [],
              "errors": {"blocks": "VendorTimeout: timed out"}, "page_sha256": "sha-a"}
-    r.store("p1", first)
+    benchmark.store(r, "p1", first)
     assert json.loads((r.predictions / "p1.json").read_text()) == {"html": "<p>a</p>", "blocks": None}
-    assert r.needs("p1", want, "sha-a") == frozenset()
-    assert r.needs("p1", want, "sha-a", retry_failed=True) == frozenset({"blocks"})
+    assert benchmark.needs(r, "p1", want, "sha-a") == frozenset()
+    assert benchmark.needs(r, "p1", want, "sha-a", retry_failed=True) == frozenset({"blocks"})
     again = {"outputs": {"blocks": []}, "errors": {}, "calls": [call], "raw": [], "page_sha256": "sha-a"}
-    kept = r.store("p1", again)
+    kept = benchmark.store(r, "p1", again)
     assert kept["outputs"] == {"html": "<p>a</p>", "blocks": []} and kept["errors"] == {}
-    assert len(kept["calls"]) == 2 and r.record("p1") == kept
-    assert r.needs("p1", want, "sha-b") == want  # another page file: all of it again
-    assert r.store("p1", first | {"page_sha256": "sha-b"})["calls"] == [call]
+    assert len(kept["calls"]) == 2 and benchmark.record(r, "p1") == kept
+    assert benchmark.needs(r, "p1", want, "sha-b") == want  # another page file: all of it again
+    assert benchmark.store(r, "p1", first | {"page_sha256": "sha-b"})["calls"] == [call]
+
+
+def test_a_run_never_started_is_not_graded(tmp_path):
+    """Most likely another folder (another option, another --out), so it is refused, not passed over."""
+    r = benchmark.Run("tesseract", {}, tmp_path / "nowhere")
+    with pytest.raises(ValueError, match="never started"):
+        benchmark.grade(r, "some/dataset")
 
 
 def test_a_page_is_fetched_at_the_commit_its_gold_was_read_at(tmp_path, monkeypatch):

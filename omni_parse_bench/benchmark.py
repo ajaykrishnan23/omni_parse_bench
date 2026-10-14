@@ -83,15 +83,18 @@ SCORER = scorer_version()
 
 
 class Run(NamedTuple):
-    """One configuration and its folder. Its methods are the bookkeeping of any loop over pages, so a
-    loop of your own (another machine, another scheduler) keeps a run exactly as `predict_all` does:
+    """One configuration and its folder: an address, as a `Path` is. What a run holds is whatever its
+    folder holds when it is read, so a run is resumed, graded or shared between processes as it stands.
+    The functions below are the bookkeeping of any loop over its pages, so a loop of your own (another
+    machine, another scheduler) keeps a run exactly as `predict_all` does:
 
-        run.start(dataset, gold, timeout)          # once: the folder, and settings.json
-        need = run.needs(page_id, want, sha)       # the outputs the page's record still lacks
-        run.store(page_id, harness.predict(...))   # the page's new record, merged and written
+        start(run, dataset, timeout)                  # once: the folder, and settings.json
+        need = needs(run, page_id, want, sha)         # the outputs the page's record still lacks
+        store(run, page_id, harness.predict(...))     # the page's new record, merged and written
+        grade(run, dataset)                           # scores.jsonl and summary.json, as they stand
 
-    then `grade_all` grades the run as `opb benchmark` does. The record given to `store` carries
-    `page_sha256`, the digest of the page file it was predicted from (`file_digest`)."""
+    The record given to `store` carries `page_sha256`, the digest of the page file it was predicted
+    from (`file_digest`)."""
 
     provider: str
     options: dict
@@ -105,36 +108,41 @@ class Run(NamedTuple):
     def predictions(self) -> Path:
         return self.out / "predictions"
 
-    def start(self, dataset: str, gold: str, timeout: float) -> None:
-        """The run's folder made, and what the run is written to its settings.json (`settle`):
-        provider, settings, dataset, the gold revision and the timeout per call."""
-        from omni_parse_bench import harness
 
-        self.records.mkdir(parents=True, exist_ok=True)
-        self.predictions.mkdir(exist_ok=True)
-        settle(self, run=self.out.name, provider=self.provider,
-               settings=harness.settings_for(self.provider, self.options), dataset=dataset_id(dataset),
-               gold=gold, timeout_s=timeout)
+def start(run: Run, dataset: str, timeout: float) -> None:
+    """The run's folder made, and what the run is written to its settings.json (`settle`): provider,
+    settings, dataset, the gold revision it is read against and the timeout per call."""
+    from omni_parse_bench import harness
 
-    def record(self, page_id: str) -> dict | None:
-        """The page's record, or None when there is none (or it can't be read)."""
-        return None if (got := read_record(self.records / f"{page_id}.json")) is None else got[0]
+    root, _, _ = load(dataset)
+    run.records.mkdir(parents=True, exist_ok=True)
+    run.predictions.mkdir(exist_ok=True)
+    settle(run, run=run.out.name, provider=run.provider,
+           settings=harness.settings_for(run.provider, run.options), dataset=dataset_id(dataset),
+           gold=gold_revision(dataset, root), timeout_s=timeout)
 
-    def needs(self, page_id: str, want: frozenset[str], page_sha: str | None = None,
-             retry_failed: bool = False) -> frozenset[str]:
-        """The outputs in `want` (what the page's tests read, `gold.wants`) the run still owes the page:
-        `missing` over its record."""
-        return missing(self.record(page_id), want, retry_failed, page_sha)
 
-    def store(self, page_id: str, record: dict) -> dict:
-        """A new record of the page made part of the run, and returned: merged into the old one when
-        both are of the same page file (`merged`), else in its place; its outputs written to
-        predictions/, then the record itself."""
-        old, sha = self.record(page_id), record.get("page_sha256")
-        kept = merged(old, record) if old is not None and old.get("page_sha256", sha) == sha else record
-        write_json(self.predictions / f"{page_id}.json", kept["outputs"])
-        write_json(self.records / f"{page_id}.json", kept)
-        return kept
+def record(run: Run, page_id: str) -> dict | None:
+    """The page's record in the run, or None when there is none (or it can't be read)."""
+    return None if (got := read_record(run.records / f"{page_id}.json")) is None else got[0]
+
+
+def needs(run: Run, page_id: str, want: frozenset[str], page_sha: str | None = None,
+          retry_failed: bool = False) -> frozenset[str]:
+    """The outputs in `want` (what the page's tests read, `gold.wants`) the run still lacks for the
+    page: `missing` over its record."""
+    return missing(record(run, page_id), want, retry_failed, page_sha)
+
+
+def store(run: Run, page_id: str, new: dict) -> dict:
+    """A new record of the page made part of the run, and returned: merged into the old one when both
+    are of the same page file (`merged`), else in its place; its outputs written to predictions/, then
+    the record itself."""
+    old, sha = record(run, page_id), new.get("page_sha256")
+    kept = merged(old, new) if old is not None and old.get("page_sha256", sha) == sha else new
+    write_json(run.predictions / f"{page_id}.json", kept["outputs"])
+    write_json(run.records / f"{page_id}.json", kept)
+    return kept
 
 
 class Plan(NamedTuple):
@@ -483,17 +491,16 @@ def predict_all(p: Plan) -> None:
     from omni_parse_bench import harness, progress
 
     root, _, tests = load(p.dataset)
-    revision = gold_revision(p.dataset, root)
     # Note: set on an interrupt, so no run starts another page; a call already made is let finish.
     stop = threading.Event()
     by: dict[str, list[Run]] = {}
     for r in p.runs:
-        r.start(p.dataset, revision, p.timeout)
+        start(r, p.dataset, p.timeout)
         by.setdefault(harness.resolve(r.provider), []).append(r)
 
     def one(r: Run, g: gold.Page, bar: progress.Reporter, halt: threading.Event) -> None:
         if stop.is_set() or halt.is_set(): return
-        want, old = gold.wants(tests[g.page_id]), r.record(g.page_id)
+        want, old = gold.wants(tests[g.page_id]), record(r, g.page_id)
         # Note: a record from before page digests is trusted, so resuming an old run fetches no page
         # only to check it.
         if old is not None and "page_sha256" not in old and not missing(old, want, p.retry_failed):
@@ -514,7 +521,7 @@ def predict_all(p: Plan) -> None:
         with bar.calling():
             new = harness.predict(r.provider, file, asked, timeout=p.timeout, **r.options)
         new["page_sha256"] = sha
-        r.store(g.page_id, new)
+        store(r, g.page_id, new)
         failed = any(why != "unsupported" for why in new["errors"].values())
         bar.record(error=failed, usd=sum(c["usd"] or 0 for c in new["calls"]),
                    wall_s=sum(c["wall_s"] for c in new["calls"]))
@@ -649,50 +656,54 @@ def headline(name: str, summary: dict) -> str:
             f"{summary['pages_pending']} pending" + (f"; {errs} tests errored in our code" if errs else ""))
 
 
-def grade_all(p: Plan, say: Callable[[str], None] = print) -> dict[str, dict]:
-    """Grade every recorded page of every run and write its scores and summary; returns summaries.
+def grade(run: Run, dataset: str, rescore: bool = False, say: Callable[[str], None] = print) -> dict:
+    """Grade every recorded page of the run and write its scores and summary; returns the summary.
 
-    Grading covers every page of the dataset a run has a record for, whatever `--suites` and
-    `--limit` chose to predict, so a smaller invocation never shrinks a run's scores. A page's lines are
-    graded again when they aren't `current`: its record, the gold (`gold_revision`) or the scorer has changed.
-    Scores are written however grading ends, so an interrupt keeps what was graded."""
-    root, every, tests = load(p.dataset)
-    revision = gold_revision(p.dataset, root)
-    out = {}
-    for r in p.runs:
-        if not r.records.is_dir():
-            say(f"{r.out.name}: nothing recorded, so nothing to grade")
-            continue
-        settle(r, gold=revision)
-        path = r.out / "scores.jsonl"
-        old = {} if p.rescore else read_scores(path)
-        lines_of, seen, calls = {}, set(), []
-        try:
-            for g in every:
-                if (got := read_record(r.records / f"{g.page_id}.json")) is not None:
-                    record, text = got
-                    calls += record["calls"]
-                    had, ts = old.get(g.page_id), tests[g.page_id]
-                    lines_of[g.page_id] = had if current(had, text, revision, ts) else grade_page(
-                        r, record, text, g, ts, revision)
-                seen.add(g.page_id)
-        finally:
-            # Note: a page not reached yet keeps its old lines, which their stamps let the next grading check.
-            kept = [lines_of.get(g.page_id) if g.page_id in seen else old.get(g.page_id) for g in every]
-            lines = [x for xs in kept for x in xs or ()]
-            write_text(path, "".join(json.dumps(x, ensure_ascii=False) + "\n" for x in lines))
-        ordered = [lines_of[g.page_id] for g in every if g.page_id in lines_of]
-        by_id = {t.id: t for g in every if g.page_id in lines_of for t in tests[g.page_id]}
-        verdicts = [metric.Verdict(x["test_id"], x["result"], x["why"]) for xs in ordered for x in xs]
-        summary = metric.summarize(verdicts, [by_id[v.id] for v in verdicts], every)
-        summary |= {"gold": revision, "scorer": SCORER, "pages": len(ordered),
-                    "pages_pending": len(every) - len(ordered),
-                    "usd": round(sum(c.get("usd") or 0 for c in calls), 4),
-                    "credits": round(sum(c.get("credits") or 0 for c in calls), 4)}
-        write_json(r.out / "summary.json", summary)
-        say(headline(r.out.name, summary))
-        out[r.out.name] = summary
-    return out
+    Grading covers every page of the dataset the run has a record for, whatever `--suites` and
+    `--limit` chose to predict, so a smaller invocation never shrinks a run's scores; a page with no
+    record is pending, not failed. A page's lines are graded again when they aren't `current`: its
+    record, the gold (`gold_revision`) or the scorer has changed. Scores are written however grading
+    ends, so an interrupt keeps what was graded. A run that was never started is refused: its folder
+    is most likely another one (another option, another --out)."""
+    if not run.records.is_dir():
+        raise ValueError(f"no run at {run.out}: {run.provider} with settings {run.options or 'by default'} "
+                         "was never started there. Check --out and --options, or start it first")
+    root, every, tests = load(dataset)
+    revision = gold_revision(dataset, root)
+    settle(run, gold=revision)
+    path = run.out / "scores.jsonl"
+    old = {} if rescore else read_scores(path)
+    lines_of, seen, calls = {}, set(), []
+    try:
+        for g in every:
+            if (got := read_record(run.records / f"{g.page_id}.json")) is not None:
+                rec, text = got
+                calls += rec["calls"]
+                had, ts = old.get(g.page_id), tests[g.page_id]
+                lines_of[g.page_id] = had if current(had, text, revision, ts) else grade_page(
+                    run, rec, text, g, ts, revision)
+            seen.add(g.page_id)
+    finally:
+        # Note: a page not reached yet keeps its old lines, which their stamps let the next grading check.
+        kept = [lines_of.get(g.page_id) if g.page_id in seen else old.get(g.page_id) for g in every]
+        lines = [x for xs in kept for x in xs or ()]
+        write_text(path, "".join(json.dumps(x, ensure_ascii=False) + "\n" for x in lines))
+    ordered = [lines_of[g.page_id] for g in every if g.page_id in lines_of]
+    by_id = {t.id: t for g in every if g.page_id in lines_of for t in tests[g.page_id]}
+    verdicts = [metric.Verdict(x["test_id"], x["result"], x["why"]) for xs in ordered for x in xs]
+    summary = metric.summarize(verdicts, [by_id[v.id] for v in verdicts], every)
+    summary |= {"gold": revision, "scorer": SCORER, "pages": len(ordered),
+                "pages_pending": len(every) - len(ordered),
+                "usd": round(sum(c.get("usd") or 0 for c in calls), 4),
+                "credits": round(sum(c.get("credits") or 0 for c in calls), 4)}
+    write_json(run.out / "summary.json", summary)
+    say(headline(run.out.name, summary))
+    return summary
+
+
+def grade_all(p: Plan, say: Callable[[str], None] = print) -> dict[str, dict]:
+    """`grade` each run of the plan; their summaries by run name."""
+    return {r.out.name: grade(r, p.dataset, p.rescore, say) for r in p.runs}
 
 
 def execute(p: Plan, say: Callable[[str], None] = print) -> dict[str, dict]:
