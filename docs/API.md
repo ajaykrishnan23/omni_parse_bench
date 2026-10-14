@@ -206,7 +206,7 @@ p = benchmark.plan(
   options=None,           # per provider: {"datalab": {"mode": "accurate"}}, or a list of dicts
   timeout=0,              # seconds per vendor call; 0: the default, 900
   workers=0,              # calls at once per adapter, shared by its runs: one number, or per adapter
-                          # or provider ({"datalab": 20}); 0, or an adapter left out: `benchmark.WORKERS`
+                          # ({"datalab": 20, "llm": 3}); 0, or an adapter left out: `benchmark.WORKERS`
   rescore=False,          # grade every page again
   score_only=False,       # grade what's recorded; call no vendor
   retry_failed=False,     # predict again outputs whose failure may not recur
@@ -244,12 +244,12 @@ Concurrency is per adapter, not per run: every run of one adapter shares one poo
 rate limit is per account. Two datalab modes share datalab's pool, and every OpenRouter model id
 shares the llm adapter's. Each adapter's pool size is in `benchmark.WORKERS` (datalab 10, extend,
 mistral and llm 5, reducto, llamaparse and azure 3, tesseract the CPU count up to 8, others 5);
-`--workers N` sets N for every adapter; `--workers '{"datalab": 20, "openai/gpt-5.6-sol": 3}'` sets
-only the ones named, by adapter or by provider (a provider names its adapter, so the example sets the
-llm adapter's pool, shared by every model id), and the others keep their defaults. An unknown name,
-a number under 1, or two numbers for one adapter is refused. When one run hits an account failure or a missing key,
-every run of its adapter stops at once; other adapters go on, the run is graded, and the failure is
-then raised.
+`--workers N` sets N for every adapter; `--workers '{"datalab": 20, "llm": 3}'` sets only the adapters
+named, and the others keep their defaults. Keys are adapters, not providers or models: the limit is
+the vendor account's, so 3 for `llm` is 3 in flight across every OpenRouter model id together. A
+model id as a key is refused, naming its adapter. When one run hits an account failure or a missing
+key, every run of its adapter stops at once; other adapters go on, the run is graded, and the failure
+is then raised.
 
 ### Settings per provider
 

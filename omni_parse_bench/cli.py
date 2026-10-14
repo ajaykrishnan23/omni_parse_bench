@@ -43,7 +43,7 @@ def read_json(path: str) -> Any:
 
 
 def read_workers(value: str) -> int | dict:
-    """`--workers` as one number for every adapter, or a JSON object of a number per adapter or provider."""
+    """`--workers` as one number for every adapter, or a JSON object of a number per adapter."""
     try:
         return int(value)
     except ValueError:
@@ -264,8 +264,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     b.add_argument("--timeout", type=float, default=900, help="seconds per vendor call")
     b.add_argument("--workers", type=read_workers, default=0, metavar="N|JSON",
                    help="calls at once per adapter, shared by its runs: N for every adapter, or a number "
-                        'per adapter or provider, e.g. \'{"datalab": 20, "openai/gpt-5.6-sol": 3}\' '
-                        "(default: a table per vendor)")
+                        'per adapter, e.g. \'{"datalab": 20, "llm": 3}\' (llm: every OpenRouter model id; '
+                        "default: a table per vendor)")
     b.add_argument("--rescore", action="store_true", help="grade every page again, after a scorer change")
     b.add_argument("--score-only", action="store_true", help="grade what's recorded; predict nothing")
     b.add_argument("--retry-failed", action="store_true",

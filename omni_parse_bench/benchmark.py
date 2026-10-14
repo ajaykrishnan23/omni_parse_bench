@@ -314,7 +314,7 @@ def plan(providers: list[str], *, out: str | Path = Path("runs"), dataset: str =
     """Every run this invocation makes, checked before any call: a bad option or provider fails here.
 
     `workers` is the calls in flight per adapter, shared by its runs: one number for every adapter, or
-    a number per adapter or provider (`per_adapter`); 0, or an adapter left out, takes `WORKERS`."""
+    a number per adapter (`per_adapter`); 0, or an adapter left out, takes `WORKERS`."""
     from omni_parse_bench import harness
 
     counts = [("--limit", limit), ("--sample", sample)]
@@ -348,26 +348,23 @@ def workers_for(adapter: str, requested: int | Mapping[str, int] = 0) -> int:
 
 
 def per_adapter(workers: Mapping[str, int]) -> dict[str, int]:
-    """`--workers` given per adapter or provider, as a number per adapter: a provider names its adapter,
-    since the limit is a vendor account's, shared by every run of its adapter."""
+    """`--workers` as a number per adapter, checked. The limit is a vendor account's, shared by every
+    run of its adapter (every OpenRouter model id shares llm's), so it is set per adapter, never per
+    provider or model."""
     from omni_parse_bench.harness import registry
 
     adapters = {m.__name__.rsplit(".", 1)[-1] for m in registry.ADAPTERS.values()} | {"llm"}
-    out: dict[str, int] = {}
     for key, n in workers.items():
+        if key not in adapters:
+            try:
+                a = registry.resolve(key)
+                hint = f"{key} uses the {a} adapter, whose pool all its runs share; write {{\"{a}\": {n}}}"
+            except ValueError:
+                hint = f"the adapters are {sorted(adapters)}"
+            raise ValueError(f"--workers is per adapter, and {key!r} isn't one: {hint}")
         if isinstance(n, bool) or not isinstance(n, int) or n < 1:
             raise ValueError(f"--workers gives {key!r} {n!r}; calls at once is a whole number, 1 or more")
-        try:
-            a = key if key in adapters else registry.resolve(key)
-        except ValueError:
-            raise ValueError(f"--workers names {key!r}, which is no adapter or provider; the adapters are "
-                             f"{sorted(adapters)}, and a provider (e.g. openai/gpt-5.6-sol) names its own"
-                             ) from None
-        if out.get(a, n) != n:
-            raise ValueError(f"--workers gives adapter {a} two numbers, {out[a]} and {n}: its runs share one "
-                             f"pool, so name it once")
-        out[a] = n
-    return out
+    return dict(workers)
 
 
 def owed(p: Plan, r: Run) -> tuple[int, int]:
