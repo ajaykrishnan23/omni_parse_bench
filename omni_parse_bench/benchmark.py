@@ -86,11 +86,11 @@ class Run(NamedTuple):
     """One configuration and its folder. Its methods are the bookkeeping of any loop over pages, so a
     loop of your own (another machine, another scheduler) keeps a run exactly as `predict_all` does:
 
-        run.start(dataset, gold, timeout)        # once: the folder, and settings.json
-        need = run.owed(page_id, want, sha)      # the outputs the page's record still lacks
-        run.keep(page_id, harness.predict(...))  # the page's new record, merged and written
+        run.start(dataset, gold, timeout)          # once: the folder, and settings.json
+        need = run.needs(page_id, want, sha)       # the outputs the page's record still lacks
+        run.store(page_id, harness.predict(...))   # the page's new record, merged and written
 
-    then `grade_all` grades the run as `opb benchmark` does. The record given to `keep` carries
+    then `grade_all` grades the run as `opb benchmark` does. The record given to `store` carries
     `page_sha256`, the digest of the page file it was predicted from (`file_digest`)."""
 
     provider: str
@@ -120,13 +120,13 @@ class Run(NamedTuple):
         """The page's record, or None when there is none (or it can't be read)."""
         return None if (got := read_record(self.records / f"{page_id}.json")) is None else got[0]
 
-    def owed(self, page_id: str, want: frozenset[str], page_sha: str | None = None,
+    def needs(self, page_id: str, want: frozenset[str], page_sha: str | None = None,
              retry_failed: bool = False) -> frozenset[str]:
         """The outputs in `want` (what the page's tests read, `gold.wants`) the run still owes the page:
         `missing` over its record."""
         return missing(self.record(page_id), want, retry_failed, page_sha)
 
-    def keep(self, page_id: str, record: dict) -> dict:
+    def store(self, page_id: str, record: dict) -> dict:
         """A new record of the page made part of the run, and returned: merged into the old one when
         both are of the same page file (`merged`), else in its place; its outputs written to
         predictions/, then the record itself."""
@@ -514,7 +514,7 @@ def predict_all(p: Plan) -> None:
         with bar.calling():
             new = harness.predict(r.provider, file, asked, timeout=p.timeout, **r.options)
         new["page_sha256"] = sha
-        r.keep(g.page_id, new)
+        r.store(g.page_id, new)
         failed = any(why != "unsupported" for why in new["errors"].values())
         bar.record(error=failed, usd=sum(c["usd"] or 0 for c in new["calls"]),
                    wall_s=sum(c["wall_s"] for c in new["calls"]))

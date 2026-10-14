@@ -315,16 +315,16 @@ run.start(p.dataset, benchmark.gold_revision(p.dataset, root), p.timeout)
 for page in p.pages:
     file = benchmark.page_file(p.dataset, root, page.doc_path)
     sha = benchmark.file_digest(file)
-    if need := run.owed(page.page_id, gold.wants(tests[page.page_id]), sha):
+    if need := run.needs(page.page_id, gold.wants(tests[page.page_id]), sha):
         record = harness.predict(run.provider, file, need, timeout=p.timeout, **run.options)
-        run.keep(page.page_id, record | {"page_sha256": sha})  # wherever it ran
+        run.store(page.page_id, record | {"page_sha256": sha})  # wherever it ran
 benchmark.grade_all(p)
 ```
 
 - `run.start(dataset, gold, timeout)` makes the folder and writes `settings.json`;
-- `run.owed(page_id, want, page_sha, retry_failed=False)` is what the page still lacks, by the rules
+- `run.needs(page_id, want, page_sha, retry_failed=False)` is what the page still lacks, by the rules
   above (pass `retry_failed=True` for `--retry-failed`);
-- `run.keep(page_id, record)` merges a new record into the old one of the same page file, writes it
+- `run.store(page_id, record)` merges a new record into the old one of the same page file, writes it
   and its prediction, and returns it; the record carries `page_sha256`; and
 - `run.record(page_id)` reads a page's record.
 
