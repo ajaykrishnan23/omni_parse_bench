@@ -515,15 +515,10 @@ def retryable(record: dict, output: str) -> bool:
 
     calls = [c for c in record.get("calls", []) if output in c.get("outputs", ())]
     if not calls: return False
-    if isinstance(failure := calls[-1].get("failure"), dict):
-        status = failure.get("status")
-        return (failure.get("class") in ("VendorTimeout", "VendorUnreachable") or status is None
-                or status in errors.TRANSIENT_STATUSES)
-    # Note: a call without a failure got an answer, or is from before calls recorded their failure;
-    # then only its error's class, which starts the error's text, is read, and only a timeout or an
-    # outage is tried again.
-    why = str(record.get("errors", {}).get(output, ""))
-    return why.startswith(("VendorTimeout:", "VendorUnreachable:"))
+    if not isinstance(failure := calls[-1].get("failure"), dict): return False   # it got an answer
+    status = failure.get("status")
+    return (failure.get("class") in ("VendorTimeout", "VendorUnreachable") or status is None
+            or status in errors.TRANSIENT_STATUSES)
 
 
 def merged(old: dict, new: dict) -> dict:

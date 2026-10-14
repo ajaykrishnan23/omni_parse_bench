@@ -149,8 +149,7 @@ def test_an_account_failure_stops_every_run_of_its_adapter_only(tmp_path, monkey
     ({"class": "VendorError", "status": None}, "VendorError: polling failed", True),
     ({"class": "VendorTimeout", "status": None}, "VendorTimeout: timed out", True),
     ({"class": "VendorUnreachable", "status": None}, "VendorUnreachable: reset", True),
-    (None, "VendorTimeout: timed out", True),       # a record from before failures were kept
-    (None, "VendorError: HTTP 503", False),          # read conservatively: only the class
+    (None, "VendorTimeout: timed out", False),      # a call without a failure got an answer
     (None, "the adapter couldn't read the answer: KeyError", False),
 ])
 def test_retry_failed_asks_again_only_what_may_go_otherwise(failure, error, again):
