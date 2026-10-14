@@ -110,18 +110,20 @@ class Run(NamedTuple):
 
 
 def prepare(run: Run, dataset: str, timeout: float) -> None:
-    """The run's folder made, and what the run asks written to its settings.json (`settle`): provider,
-    settings, dataset (and the commit of a Hugging Face one) and the timeout per call. Which gold and
-    scorer it was graded with, `grade` writes."""
+    """The run's folder made, and what the run asks written to its settings.json, beside what it already
+    says: provider, settings, dataset (and the commit of a Hugging Face one) and the timeout per call.
+    What graded it is stamped on its score lines and in summary.json."""
     from omni_parse_bench import harness
 
     root, _ = manifest(dataset)
     run.records.mkdir(parents=True, exist_ok=True)
     run.predictions.mkdir(exist_ok=True)
     commit = {"commit": root.name} if str(dataset).startswith(HF_PREFIX) else {}
-    settle(run, run=run.out.name, provider=run.provider,
-           settings=harness.settings_for(run.provider, run.options), dataset=dataset_id(dataset),
-           **commit, timeout_s=timeout)
+    path = run.out / "settings.json"
+    write_json(path, (read_json(path) or {}) | {
+        "run": run.out.name, "provider": run.provider,
+        "settings": harness.settings_for(run.provider, run.options), "dataset": dataset_id(dataset),
+        **commit, "timeout_s": timeout})
 
 
 def recorded(run: Run, page_id: str) -> dict | None:
@@ -367,7 +369,7 @@ def facts(p: Plan):
     return table
 
 
-def owed(p: Plan, r: Run, revision: str) -> tuple[int, int]:
+def owed(p: Plan, r: Run) -> tuple[int, int]:
     """How many of the plan's pages this run will predict, and grade, by the rules `predict_all` and
     `grade_all` follow."""
     _, _, tests = load(p.dataset)
@@ -378,8 +380,7 @@ def owed(p: Plan, r: Run, revision: str) -> tuple[int, int]:
         record, text = got if got is not None else (None, "")
         coming = not p.score_only and bool(missing(record, frozenset(g.outputs), p.retry_failed))
         predict += coming
-        grade += coming or (record is not None and not current(rows.get(g.page_id), text, revision,
-                                                                 tests[g.page_id]))
+        grade += coming or (record is not None and not current(rows.get(g.page_id), text, tests[g.page_id]))
     return predict, grade
 
 
@@ -393,8 +394,6 @@ def plan_view(p: Plan):
 
     from omni_parse_bench import harness
 
-    revision = gold_revision(p.dataset)
-
     table = Table(box=box.ROUNDED, header_style="dim", expand=False)
     table.add_column("adapter", overflow="fold")
     table.add_column("run", overflow="fold")
@@ -402,7 +401,7 @@ def plan_view(p: Plan):
     table.add_column("predict", justify="right", no_wrap=True)
     table.add_column("grade", justify="right", no_wrap=True)
     for r in p.runs:
-        to_predict, to_grade = owed(p, r, revision)
+        to_predict, to_grade = owed(p, r)
         settings = [f"{k}={v}" for k, v in harness.settings_for(r.provider, r.options).items()]
         cell: list = []
         for n, x in enumerate(settings):
@@ -482,11 +481,6 @@ def read_scores(path: Path) -> dict[str, list[dict]]:
     if bad: log.warning("%s: %d line(s) not read; their pages are graded again", path, bad)
     return dict(out)
 
-
-def settle(r: Run, **facts: Any) -> None:
-    """`facts` written into the run's settings.json, beside what it already says."""
-    path = r.out / "settings.json"
-    write_json(path, (read_json(path) or {}) | facts)
 
 
 def predict_all(p: Plan) -> None:
@@ -610,13 +604,12 @@ def digest(text: str) -> str:
     return hashlib.sha256(text.encode()).hexdigest()[:16]
 
 
-def current(lines: Sequence[dict] | None, record: str, revision: str, tests: Sequence[gold.Test]) -> bool:
-    """Whether a page's score lines still stand: they grade the record whose digest is `record`, against
-    this gold and with this scorer, one line for each of the page's tests (a renamed test is graded
-    again)."""
+def current(lines: Sequence[dict] | None, record: str, tests: Sequence[gold.Test]) -> bool:
+    """Whether a page's score lines still stand: they grade the record whose digest is `record`, one
+    line for each of the page's tests (a line lost is graded again). Their gold and scorer are the
+    run's, which `refuse_regrading` makes sure of before any page is graded."""
     if not lines: return False
-    return (all(x.get("record") == record and x.get("gold") == revision and x.get("scorer") == SCORER
-                for x in lines)
+    return (all(x.get("record") == record for x in lines)
             and sorted(x["test_id"] for x in lines) == sorted(t.id for t in tests))
 
 
@@ -656,8 +649,8 @@ def grade(run: Run, dataset: str, rescore: bool = False, say: Callable[[str], No
     `--limit` chose to predict, so a smaller invocation never shrinks a run's scores; a page with no
     record is pending, not failed. A page's lines are graded again when they aren't `current`: its
     record or the page's tests have changed. A run graded with another gold or scorer is refused
-    (`refuse_regrading`) unless `rescore`, which grades every page again; the gold and scorer it
-    was graded with are written to its settings.json. Scores are written however grading ends, so an
+    (`refuse_regrading`) unless `rescore`, which grades every page again; each line and summary.json
+    say which gold and scorer graded them. Scores are written however grading ends, so an
     interrupt keeps what was graded. A run that was never prepared is refused: its folder
     is most likely another one (another option, another --out)."""
     if not run.records.is_dir():
@@ -666,7 +659,6 @@ def grade(run: Run, dataset: str, rescore: bool = False, say: Callable[[str], No
     root, every, tests = load(dataset)
     revision = gold_revision(dataset)
     if not rescore: refuse_regrading(run, revision)
-    settle(run, gold=revision, scorer=SCORER)
     path = run.out / "scores.jsonl"
     old = {} if rescore else read_scores(path)
     lines_of, seen, calls = {}, set(), []
@@ -676,7 +668,7 @@ def grade(run: Run, dataset: str, rescore: bool = False, say: Callable[[str], No
                 rec, text = got
                 calls += rec["calls"]
                 had, ts = old.get(g.page_id), tests[g.page_id]
-                lines_of[g.page_id] = had if current(had, text, revision, ts) else grade_page(
+                lines_of[g.page_id] = had if current(had, text, ts) else grade_page(
                     run, rec, text, g, ts, revision)
             seen.add(g.page_id)
     finally:

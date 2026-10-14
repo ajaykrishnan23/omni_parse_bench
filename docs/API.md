@@ -557,21 +557,20 @@ accurate. The digest isn't meant to be read; `settings.json` is.
 
 ### settings.json
 
-What the run asks, written before the first page, so an interrupted run still says what it is; and,
-once graded, what graded it.
+What the run asks, written before the first page, so an interrupted run still says what it is. What
+graded it is on each score line and in `summary.json`.
 
 ```json
 {"run": "datalab-296b76d9", "provider": "datalab",
  "settings": {"mode": "balanced", "base_url": "https://www.datalab.to", "poll_interval": 2.0},
  "dataset": "hf://datasets/datalab-to/omni_parse_bench", "commit": "175cc91a9df1a8d1ee2339ad652d3dce20852911",
- "timeout_s": 900, "gold": "fb8cb369b9538d1a", "scorer": "0.1.1+a09ce5ecf32a"}
+ "timeout_s": 900}
 ```
 
 - `settings` is the whole resolved configuration, not just what you passed;
 - `dataset` is the dataset's repo, or a folder's path: a later invocation with another is refused;
-  `commit` is the Hugging Face commit the run reads;
-- `timeout_s` is the latest invocation's; each call in a record keeps its own; and
-- `gold` and `scorer` are what the run was graded with; only `--rescore` changes them.
+  `commit` is the Hugging Face commit the run reads; and
+- `timeout_s` is the latest invocation's; each call in a record keeps its own.
 
 ### summary.json
 

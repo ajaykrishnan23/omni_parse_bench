@@ -216,7 +216,9 @@ def test_a_run_folder_holds_one_dataset_and_records_its_gold(tmp_path, monkeypat
     (run,) = p.runs
     settings = json.loads((run.out / "settings.json").read_text())
     assert settings["dataset"] == benchmark.dataset_id(one) and settings["timeout_s"] == 30
-    assert settings["gold"] == benchmark.gold_revision(one) and settings["scorer"] == benchmark.SCORER
+    (summary,) = [json.loads((run.out / "summary.json").read_text())]
+    assert summary["gold"] == benchmark.gold_revision(one) and summary["scorer"] == benchmark.SCORER
+    assert "gold" not in settings, "settings.json says what the run asks; what graded it is on its lines"
     with pytest.raises(ValueError, match="never mixes datasets"):
         benchmark.plan(["stub"], out=tmp_path / "runs", dataset=two)
     gold = pathlib.Path(one) / "gold" / "a-p0.json"
@@ -225,8 +227,8 @@ def test_a_run_folder_holds_one_dataset_and_records_its_gold(tmp_path, monkeypat
     with pytest.raises(ValueError, match="--rescore"):
         benchmark.plan(["stub"], out=tmp_path / "runs", dataset=one)
     benchmark.execute(benchmark.plan(["stub"], out=tmp_path / "runs", dataset=one, rescore=True), say=QUIET)
-    settings = json.loads((run.out / "settings.json").read_text())
-    assert settings["gold"] == benchmark.gold_revision(one) and "golds" not in settings
+    summary = json.loads((run.out / "summary.json").read_text())
+    assert summary["gold"] == benchmark.gold_revision(one)
 
 
 def test_a_dataset_change_that_grades_nothing_differently_is_the_same_gold(tmp_path):
@@ -318,12 +320,11 @@ def test_the_plan_counts_what_will_be_predicted(tmp_path, monkeypatch):
     data = dataset(tmp_path / "data", blocks=True)
     p = benchmark.plan(["stub"], out=tmp_path / "runs", dataset=data)
     (run,) = p.runs
-    revision = benchmark.gold_revision(data)
-    assert benchmark.owed(p, run, revision) == (1, 1)
+    assert benchmark.owed(p, run) == (1, 1)
     benchmark.execute(p, say=QUIET)
     assert saved(run)["errors"]["blocks"] == "unsupported"
-    assert benchmark.owed(p, run, revision) == (0, 0), "an unsupported output is settled"
-    assert benchmark.owed(p._replace(retry_failed=True), run, revision) == (1, 1)
+    assert benchmark.owed(p, run) == (0, 0), "an unsupported output is settled"
+    assert benchmark.owed(p._replace(retry_failed=True), run) == (1, 1)
     assert "predict" in benchmark.describe(p)
 
 
