@@ -234,7 +234,7 @@ opb benchmark --providers datalab openai/gpt-5.6-sol --out runs/ --limit 5
 
 It shows the plan (each run, its settings, and how many pages it will predict and grade) and, in a
 terminal, asks before calling any vendor; `-y` skips the question, and a script or pipe proceeds
-without it. It prints each run's scores with `pages` (graded) and `pages_pending` (no record yet)
+without it. It prints each run's scores with `pages` (graded) and `pages_pending` (no prediction yet)
 beside them. It exits 2, with a warning, when a test's grading failed in our code (`errors` in a
 summary's output type), since those tests are left out of the score.
 
@@ -285,15 +285,15 @@ It's resumable, and safe to run twice.
   and pages are pinned to a dataset commit and never edited in place. To predict again after a
   dataset's pages change, use a new `--out`;
 - a record that isn't readable JSON counts as not predicted, and is logged;
-- a page is graded again when its lines in `scores.jsonl` are missing or unreadable, or its record
-  has changed (it was predicted again);
+- a page is graded again when its lines in `scores.jsonl` are missing or unreadable, or its
+  prediction has changed (it was predicted again);
 - a run graded with another gold or scorer is refused, before any call: grading it again would change
   its scores, so `--rescore` does that, every page at once, never a mix of two. The gold is a digest
   of what grading reads (each page's id, document and suite, and its gold file), so a dataset commit
   that changes nothing graded (its card, a results table, the derived `outputs`) is the same gold.
   The scorer is the digest of the scoring code, so a release that changes no scoring file is the
   same scorer;
-- grading covers every page the run has a record for, so `--limit` and `--suites` narrow what is
+- grading covers every page the run has a prediction for, so `--limit` and `--suites` narrow what is
   predicted, never what is scored; and
 - scores are written however grading ends, so an interrupt keeps what was graded.
 
@@ -350,9 +350,10 @@ benchmark.grade(run, p.dataset)
   everything every time can skip `needs`; it is what makes a loop resumable;
 - `record(run, page_id, result)` writes: it merges a new result (a record from `predict`) into what
   the run has for the page, writes it and its prediction, and returns what it kept;
-- `recorded(run, page_id)` reads: what the run has recorded for the page, or None; and
-- `grade(run, dataset)` grades the pages recorded so far, writes `scores.jsonl` and `summary.json`, and
-  returns the summary. A page with no record is pending, not failed; a run never prepared is refused.
+- `recorded(run, page_id)` reads the page's record (its calls, for an audit), or None;
+- `predicted(run, page_id)` reads the page's outputs and their digest, or None: what grading reads; and
+- `grade(run, dataset)` grades the pages predicted so far, writes `scores.jsonl` and `summary.json`, and
+  returns the summary. A page with no prediction is pending, not failed; a run never prepared is refused.
 
 The folder is then exactly one `opb benchmark` writes, so either can resume or grade it.
 
@@ -402,7 +403,8 @@ harness.settings_for("datalab", {"mode": "balanced"})
 
 [providers.md](./providers.md) says what each adapter sends and how it maps the vendor's output to
 html and blocks. A provider of your own can't be plugged into `benchmark` yet; to grade your own model,
-loop over `score` (see [The dataset](#the-dataset)).
+write its predictions to a folder and run `opb grade` on it (see [Grading your own
+predictions](#grading-your-own-predictions)), or loop over `score` (see [The dataset](#the-dataset)).
 
 
 ## The dataset
@@ -445,9 +447,23 @@ for p in pages:
 summary = summarize(verdicts, tests, pages)
 ```
 
-`p.outputs` is what to predict for the page: the outputs its tests read (`gold.wants`). A manifest
-from before the column has it read from the gold, and a manifest whose `outputs` disagree with the
-gold is refused. `gold.read(path)` reads one gold file.
+`p.outputs` is what to predict for the page: the outputs its tests read (`gold.wants`). A page whose
+manifest `outputs` disagree with its gold is refused. `gold.read(path)` reads one gold file.
+
+### Grading your own predictions
+
+Write each page's outputs to `predictions/<page_id>.json`, as `{"html": ..., "blocks": ...}` (an
+output your system failed on is `null`), and grade the folder:
+
+```bash
+opb grade mine/ --unsupported blocks      # mine/predictions/<page_id>.json, one per page you predicted
+```
+
+`--unsupported` names the outputs your system can't produce, once for the folder; their tests are
+`unsupported` rather than failed, and it is kept in `mine/settings.json`. An output a page asks for
+that its prediction leaves out fails, so leaving out a hard page's output can't take it out of the
+score. A page with no prediction is pending. The folder gets `scores.jsonl` and `summary.json`, as a
+run's does, and is graded again as its predictions change.
 
 ### Exploring the tests
 
@@ -570,13 +586,15 @@ graded it is on each score line and in `summary.json`.
 {"run": "datalab-296b76d9", "provider": "datalab",
  "settings": {"mode": "balanced", "base_url": "https://www.datalab.to", "poll_interval": 2.0},
  "dataset": "hf://datasets/datalab-to/omni_parse_bench", "commit": "175cc91a9df1a8d1ee2339ad652d3dce20852911",
- "timeout_s": 900}
+ "timeout_s": 900, "unsupported": []}
 ```
 
 - `settings` is the whole resolved configuration, not just what you passed;
 - `dataset` is the dataset's repo, or a folder's path: a later invocation with another is refused;
-  `commit` is the Hugging Face commit the run reads; and
-- `timeout_s` is the latest invocation's; each call in a record keeps its own.
+  `commit` is the Hugging Face commit the run reads;
+- `timeout_s` is the latest invocation's; each call in a record keeps its own; and
+- `unsupported` is the outputs the provider can't produce (from its adapter): their tests are
+  `unsupported`, not failed. Grading refuses a folder that doesn't say it.
 
 ### summary.json
 
@@ -596,20 +614,20 @@ and cost:
 - `scorer` is the package version and a digest of its scoring code, which graded it; only the
   digest decides whether a run is refused;
 - `pages` is how many pages were graded, and `pages_pending` how many of the dataset's pages have
-  no record yet; and
+  no prediction yet; and
 - `usd` and `credits` are what the vendor said the calls cost.
 
 ### records/&lt;page_id&gt;.json
 
-Everything about one page's prediction: the record `predict` returns (outputs, errors, calls, raw
-answers, settings), with the time it was captured. Each call keeps its timeout (`timeout_s`) and its
+Everything about one page's prediction, for an audit: the record `predict` returns (outputs, errors,
+calls, raw answers, settings), with the time it was captured. Grading reads only its cost. Each call keeps its timeout (`timeout_s`) and its
 failure (`class`, `status`, `transient`), which `--retry-failed` reads. The raw answers are what
 `opb reparse` reads. A record from before this version may also hold `page_sha256`; it is ignored.
 
 ### predictions/&lt;page_id&gt;.json
 
-The outputs alone, `{"html": ..., "blocks": ...}`: what `score` reads, and the same thing as
-`record["outputs"]`.
+The outputs alone, `{"html": ..., "blocks": ...}`, the same as `record["outputs"]`: all grading reads.
+A folder of these, made by anything, is graded the same way (`opb grade`).
 
 ### scores.jsonl
 
@@ -620,12 +638,12 @@ One line per test, in manifest order: its verdict, what the test is, and the sta
  "suite": "olmo_arxiv_math", "document": "olmo_arxiv_math:2502.15977",
  "test_id": "2502.15977_pg21_math_003", "test_type": "present", "output_type": "html",
  "derivation": "upstream_olmocr", "tags": ["math"], "result": "pass", "why": "",
- "record": "5f0c...", "gold": "fb8cb369b9538d1a", "scorer": "0.1.1+a09ce5ecf32a"}
+ "prediction": "5f0c...", "gold": "fb8cb369b9538d1a", "scorer": "0.1.2+f5c5ce802b77"}
 ```
 
 - `run` and `provider` name the run (its folder) and its provider; `settings.json` has the rest;
 - `page_id` to `tags` say what the test is (`opb tests` writes the same, its id as `id`);
 - `result` is `pass`, `fail`, `unsupported` or `error`, and `why` says what went wrong; and
-- `record`, `gold` and `scorer` stamp what was graded and by what: a line whose record changed is
-  graded again on the next `opb benchmark`, and a run whose lines were graded with another gold or
+- `prediction`, `gold` and `scorer` stamp what was graded and by what: a line whose prediction
+  changed is graded again on the next `opb benchmark` or `opb grade`, and a run whose lines were graded with another gold or
   scorer is refused until `--rescore`.

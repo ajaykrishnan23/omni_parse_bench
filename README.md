@@ -163,8 +163,9 @@ opb score --pred outputs.json --gold gold/<page_id>.json
 ```
 
 It prints the verdicts. A score is a number over many pages: `summarize` in your code, or
-`summary.json` from `opb benchmark`. To grade your own model on the whole dataset, see
-[The dataset](./docs/API.md#the-dataset).
+`summary.json` from `opb benchmark`. To grade your own model on the whole dataset, write its outputs to
+`predictions/<page_id>.json` and run `opb grade` on the folder (see [Grading your own
+predictions](./docs/API.md#grading-your-own-predictions)).
 
 ## Predict
 

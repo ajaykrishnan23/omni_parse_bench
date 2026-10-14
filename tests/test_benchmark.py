@@ -664,7 +664,7 @@ def test_scores_are_one_line_per_test_with_what_the_test_is(tmp_path, monkeypatc
     lines = [json.loads(x) for x in (run.out / "scores.jsonl").read_text().splitlines()]
     assert [x["page_id"] for x in lines] == ["a-p0", "a-p1"]
     assert list(lines[0]) == ["run", "provider", "page_id", "suite", "document", "test_id", "test_type",
-                              "output_type", "derivation", "tags", "result", "why", "record", "gold",
+                              "output_type", "derivation", "tags", "result", "why", "prediction", "gold",
                               "scorer"]
     assert lines[0]["run"] == run.out.name and lines[0]["provider"] == "stub"
 
@@ -687,8 +687,8 @@ def test_a_page_of_several_tests_is_graded_again_whole_and_only_when_stale(tmp_p
     graded = graded_pages(monkeypatch)
     benchmark.execute(p._replace(score_only=True), say=QUIET)
     assert graded == []
-    rec = run.records / "a-p0.json"     # a-p0: its record changed; a-p1: one line lost
-    rec.write_text(json.dumps(json.loads(rec.read_text()), indent=1))
+    pred = run.predictions / "a-p0.json"     # a-p0: its prediction changed; a-p1: one line lost
+    pred.write_text(json.dumps(json.loads(pred.read_text()), indent=1))
     path.write_text("".join(json.dumps(x) + "\n" for x in lines[:3]))
     benchmark.execute(p._replace(score_only=True), say=QUIET)
     assert graded == ["a-p0", "a-p1"]
@@ -707,3 +707,70 @@ def test_a_line_missing_a_column_is_graded_again_not_a_crash(tmp_path, monkeypat
     graded = graded_pages(monkeypatch)
     (s,) = benchmark.execute(p._replace(score_only=True), say=QUIET).values()
     assert graded == ["a-p0", "a-p1"] and s["pages"] == 2
+
+
+# 12. Grading reads predictions/ alone, with what the run can't produce said once in settings.json.
+
+def test_prepare_says_what_the_provider_cannot_produce(tmp_path, monkeypatch):
+    use(monkeypatch, {"stub": stub(supports=frozenset({"html"}))})
+    p = benchmark.plan(["stub"], out=tmp_path / "runs", dataset=dataset(tmp_path / "data"))
+    benchmark.execute(p, say=QUIET)
+    assert json.loads((p.runs[0].out / "settings.json").read_text())["unsupported"] == ["blocks"]
+
+
+def test_a_changed_prediction_is_graded_and_the_record_is_not_read(tmp_path, monkeypatch):
+    use(monkeypatch, {"stub": stub()})
+    p = benchmark.plan(["stub"], out=tmp_path / "runs", dataset=dataset(tmp_path / "data"))
+    (s,) = benchmark.execute(p, say=QUIET).values()
+    assert s["html"]["score"] == 1.0
+    (run,) = p.runs
+    (run.predictions / "a-p0.json").write_text(json.dumps({"html": "<p>beta</p>"}))
+    monkeypatch.setattr(benchmark, "recorded", lambda run, page_id: None)     # as if it had no records
+    assert benchmark.grade(run, p.dataset, say=QUIET)["html"]["score"] == 0.0
+
+
+def test_a_folder_of_your_own_predictions_is_graded(tmp_path, capsys):
+    """No records, no provider: predictions/ and what the system can't produce are all it takes."""
+    data = dataset(tmp_path / "data", n=2, blocks=True)
+    mine = tmp_path / "mine"
+    (mine / "predictions").mkdir(parents=True)
+    (mine / "predictions" / "a-p0.json").write_text(json.dumps({"html": "<p>alpha</p>"}))
+    assert cli.main(["grade", str(mine), "--dataset", data, "--unsupported", "blocks"]) == 0
+    assert json.loads((mine / "settings.json").read_text())["unsupported"] == ["blocks"]
+    lines = [json.loads(x) for x in (mine / "scores.jsonl").read_text().splitlines()]
+    assert [(x["test_id"], x["result"]) for x in lines] == [("t0", "pass"), ("k0", "unsupported")]
+    out = json.loads(capsys.readouterr().out)
+    assert out["html"] == 1.0 and out["pages"] == 1 and out["pages_pending"] == 1
+
+
+def test_an_output_left_out_fails_rather_than_being_unsupported(tmp_path):
+    """Unsupported is said once for the folder, so leaving an output out on a hard page fails it."""
+    data = dataset(tmp_path / "data", blocks=True)
+    mine = tmp_path / "mine"
+    (mine / "predictions").mkdir(parents=True)
+    (mine / "predictions" / "a-p0.json").write_text(json.dumps({"html": "<p>alpha</p>"}))
+    (mine / "settings.json").write_text(json.dumps({"unsupported": []}))
+    benchmark.grade(benchmark.Run("mine", {}, mine), data, say=QUIET)
+    lines = [json.loads(x) for x in (mine / "scores.jsonl").read_text().splitlines()]
+    assert [(x["test_id"], x["result"]) for x in lines] == [("t0", "pass"), ("k0", "fail")]
+
+
+def test_a_folder_that_doesnt_say_what_it_cannot_produce_is_refused(tmp_path):
+    data = dataset(tmp_path / "data")
+    mine = tmp_path / "mine"
+    (mine / "predictions").mkdir(parents=True)
+    with pytest.raises(ValueError, match="--unsupported"):
+        benchmark.grade(benchmark.Run("mine", {}, mine), data, say=QUIET)
+
+
+def test_a_page_whose_prediction_is_lost_is_predicted_again_not_left_pending(tmp_path, monkeypatch):
+    """Grading reads predictions alone, so a record without one would never be graded."""
+    calls = []
+    use(monkeypatch, {"stub": stub(call=lambda config: calls.append(1) or contract.Call({"html": "alpha"}))})
+    p = benchmark.plan(["stub"], out=tmp_path / "runs", dataset=dataset(tmp_path / "data"))
+    benchmark.execute(p, say=QUIET)
+    (run,) = p.runs
+    (run.predictions / "a-p0.json").unlink()
+    assert benchmark.owed(p, run) == (1, 1)
+    (s,) = benchmark.execute(p, say=QUIET).values()
+    assert len(calls) == 2 and s["pages"] == 1 and s["pages_pending"] == 0

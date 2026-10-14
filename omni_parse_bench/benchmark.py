@@ -13,18 +13,22 @@ no vendor call. Each page is asked for exactly the outputs its tests read.
 
 A run directory holds:
 
-    settings.json                what the run asks: provider, settings, dataset (and commit), timeout
-    records/<page_id>.json       what `predict` returned: outputs, errors, calls, raw responses
-    predictions/<page_id>.json   the outputs alone, which scoring reads
+    settings.json                what the run asks: provider, settings, dataset (and commit), timeout,
+                                 and the outputs its provider can't produce (`unsupported`)
+    predictions/<page_id>.json   the outputs alone, {"html": ..., "blocks": ...}: all grading reads
+    records/<page_id>.json       what `predict` returned: outputs, errors, calls, raw responses and
+                                 cost, for an audit and for `opb reparse`; grading only sums the cost
     scores.jsonl                 one line per test: its verdict, what the test is (page, suite,
                                  document, type, tags, ...), and the stamps of what graded it
     summary.json                 metric.summarize over every graded page, plus cost and coverage
 
 Resumable: a page is predicted again only for the outputs its record lacks, and graded again only
-when its lines are missing or its record changed. A run never mixes datasets, golds or scorers: one
-graded with another gold or scorer is refused unless --rescore. Concurrency is per adapter, not per run:
-every run of one adapter (two datalab modes, every OpenRouter model) shares one pool of `workers_for`
-its adapter. Credentials come from the environment and everything else from `--options`.
+when its lines are missing or its prediction changed. A folder of predictions/ made by anything (your
+own model) is graded the same way, with what it can't produce said in its settings.json (`opb grade`).
+A run never mixes datasets, golds or scorers: one graded with another gold or scorer is refused unless
+--rescore. Concurrency is per adapter, not per run: every run of one adapter (two datalab modes, every
+OpenRouter model) shares one pool of `workers_for` its adapter. Credentials come from the environment
+and everything else from `--options`.
 
     pip install 'omni-parse-bench[benchmark]'
 """
@@ -117,9 +121,11 @@ class Run(NamedTuple):
 
 def prepare(run: Run, dataset: str, timeout: float) -> None:
     """The run's folder made, and what the run asks written to its settings.json, beside what it already
-    says: provider, settings, dataset (and the commit of a Hugging Face one) and the timeout per call.
-    What graded it is stamped on its score lines and in summary.json."""
+    says: provider, settings, dataset (and the commit of a Hugging Face one), the timeout per call and the
+    outputs its provider can't produce (`unsupported`). What graded it is stamped on its score lines and
+    in summary.json."""
     from omni_parse_bench import harness
+    from omni_parse_bench.harness import registry
 
     root, _ = manifest(dataset)
     run.records.mkdir(parents=True, exist_ok=True)
@@ -129,18 +135,36 @@ def prepare(run: Run, dataset: str, timeout: float) -> None:
     write_json(path, (read_json(path) or {}) | {
         "run": run.out.name, "provider": run.provider,
         "settings": harness.settings_for(run.provider, run.options), "dataset": dataset_id(dataset),
-        **commit, "timeout_s": timeout})
+        **commit, "timeout_s": timeout,
+        "unsupported": sorted(set(vocab.OUTPUT_TYPES) - registry.adapter(run.provider).SUPPORTS)})
 
 
 def recorded(run: Run, page_id: str) -> dict | None:
-    """What the run has recorded for the page, or None when nothing (or nothing readable)."""
-    return None if (got := read_record(run.records / f"{page_id}.json")) is None else got[0]
+    """The page's record, the audit trail of its calls (`records/`), or None when it has none (or none
+    readable)."""
+    got = _read(run.records / f"{page_id}.json",
+                lambda r: isinstance(r, dict) and isinstance(r.get("outputs"), dict) and "calls" in r,
+                "a record")
+    return None if got is None else got[0]
+
+
+def predicted(run: Run, page_id: str) -> tuple[dict, str] | None:
+    """The page's outputs (`predictions/`), `{output type: its value, or None when it failed}`, and the
+    digest of their file, which grading stamps; None when it has none (or none readable)."""
+    return _read(run.predictions / f"{page_id}.json",
+                 lambda o: isinstance(o, dict) and set(o) <= set(vocab.OUTPUT_TYPES),
+                 f"a prediction (an object whose keys are among {list(vocab.OUTPUT_TYPES)})")
 
 
 def needs(run: Run, page: gold.Page, retry_failed: bool = False) -> frozenset[str]:
     """The outputs the run still lacks for the page: of those the manifest says to predict for it
-    (`page.outputs`), what its record doesn't settle (`missing`)."""
-    return missing(recorded(run, page.page_id), frozenset(page.outputs), retry_failed)
+    (`page.outputs`), what its record doesn't settle (`missing`).
+
+    Note: a page whose prediction can't be read counts as having no record, so it is predicted again:
+    grading reads predictions alone, and a record without one would leave the page pending for good.
+    `opb reparse` rebuilds the predictions from the records without a call."""
+    old = recorded(run, page.page_id) if predicted(run, page.page_id) is not None else None
+    return missing(old, frozenset(page.outputs), retry_failed)
 
 
 def record(run: Run, page_id: str, new: dict) -> dict:
@@ -383,7 +407,7 @@ def owed(p: Plan, r: Run) -> tuple[int, int]:
     predict = grade = 0
     for g in p.pages:
         coming = not p.score_only and bool(needs(r, g, p.retry_failed))
-        got = read_record(r.records / f"{g.page_id}.json")
+        got = predicted(r, g.page_id)
         predict += coming
         grade += coming or (got is not None and not current(rows.get(g.page_id), got[1], tests[g.page_id]))
     return predict, grade
@@ -419,21 +443,38 @@ def read_json(path: Path) -> Any:
         return None
 
 
-def read_record(path: Path) -> tuple[dict, str] | None:
-    """A record and the digest of its text, or None when it's absent or unreadable (logged), which
-    makes its page one not predicted."""
+def _read(path: Path, valid: Callable[[Any], bool], what: str) -> tuple[Any, str] | None:
+    """A run file's contents and the digest of its text; None when it's absent, or unreadable or not
+    `what` (logged), which makes its page one not predicted."""
     try:
         text = path.read_text()
-        record = json.loads(text)
+        got = json.loads(text)
     except FileNotFoundError:
         return None
     except (json.JSONDecodeError, UnicodeDecodeError) as exc:
         log.warning("%s isn't readable JSON (%s); its page counts as not predicted", path, exc)
         return None
-    if not (isinstance(record, dict) and isinstance(record.get("outputs"), dict) and "calls" in record):
-        log.warning("%s isn't a record; its page counts as not predicted", path)
+    if not valid(got):
+        log.warning("%s isn't %s; its page counts as not predicted", path, what)
         return None
-    return record, digest(text)
+    return got, digest(text)
+
+
+def unsupported(run: Run) -> frozenset[str]:
+    """The outputs the run's system can't produce, whose tests are `unsupported` rather than failed, as
+    its settings.json says (`prepare` writes it from the adapter; `opb grade --unsupported` from you).
+
+    Note: one set for the whole run, never read off a page: a prediction that leaves out an output its
+    page asks for fails that output's tests, so leaving out hard pages can't take them out of a score."""
+    path = run.out / "settings.json"
+    said = (read_json(path) or {}).get("unsupported")
+    if said is None:
+        raise ValueError(f"{path} doesn't say which outputs the run can't produce. Add \"unsupported\": [] "
+                         "(or e.g. [\"blocks\"]) to it, or pass --unsupported to opb grade")
+    if not (isinstance(said, list) and set(said) <= set(vocab.OUTPUT_TYPES)):
+        raise ValueError(f"{path}: unsupported must be a list of output types from "
+                         f"{list(vocab.OUTPUT_TYPES)}, not {said!r}")
+    return frozenset(said)
 
 
 def read_scores(path: Path) -> dict[str, list[dict]]:
@@ -567,30 +608,30 @@ def merged(old: dict, new: dict) -> dict:
 
 
 def digest(text: str) -> str:
-    """A record's digest, kept on its page's score lines, so a changed record is graded again."""
+    """A prediction's digest, kept on its page's score lines, so a changed prediction is graded again."""
     return hashlib.sha256(text.encode()).hexdigest()[:16]
 
 
-def current(lines: Sequence[dict] | None, record: str, tests: Sequence[gold.Test]) -> bool:
-    """Whether a page's score lines still stand: they grade the record whose digest is `record`, one
-    line for each of the page's tests (a line lost is graded again). Their gold and scorer are the
+def current(lines: Sequence[dict] | None, prediction: str, tests: Sequence[gold.Test]) -> bool:
+    """Whether a page's score lines still stand: they grade the prediction whose digest is `prediction`,
+    one line for each of the page's tests (a line lost is graded again). Their gold and scorer are the
     run's, which `refuse_regrading` makes sure of before any page is graded."""
     if not lines: return False
-    return (all(x.get("record") == record for x in lines)
+    return (all(x.get("prediction") == prediction for x in lines)
             and sorted(x["test_id"] for x in lines) == sorted(t.id for t in tests))
 
 
-def grade_page(r: Run, record: dict, record_digest: str, page: gold.Page, tests: Sequence[gold.Test],
-               revision: str) -> list[dict]:
+def grade_page(r: Run, outputs: dict, prediction: str, page: gold.Page, tests: Sequence[gold.Test],
+               revision: str, cannot: frozenset[str]) -> list[dict]:
     """One page's score lines, one per test: the verdict beside what its test is, so a run's scores
-    are a table to query as they stand, stamped with what they grade and what graded them."""
-    unsupported = {o for o, why in record.get("errors", {}).items() if why == "unsupported"}
-    vs = metric.score(record["outputs"], tests, unsupported)
+    are a table to query as they stand, stamped with what they grade and what graded them. `cannot`
+    is what the run's system can't produce (`unsupported`)."""
+    vs = metric.score(outputs, tests, cannot)
     return [{"run": r.out.name, "provider": r.provider, "page_id": page.page_id, "suite": page.suite,
              "document": page.document, "test_id": t.id, "test_type": t.test_type,
              "output_type": t.output_type, "derivation": t.derivation, "tags": list(t.tags),
              "result": v.result, "why": v.why,
-             "record": record_digest, "gold": revision, "scorer": SCORER}
+             "prediction": prediction, "gold": revision, "scorer": SCORER}
             for t, v in zip(tests, vs, strict=True)]
 
 
@@ -610,19 +651,22 @@ def headline(name: str, summary: dict) -> str:
 
 
 def grade(run: Run, dataset: str, rescore: bool = False, say: Callable[[str], None] = print) -> dict:
-    """Grade every recorded page of the run and write its scores and summary; returns the summary.
+    """Grade every predicted page of the run and write its scores and summary; returns the summary.
 
-    Grading covers every page of the dataset the run has a record for, whatever `--suites` and
-    `--limit` chose to predict, so a smaller invocation never shrinks a run's scores; a page with no
-    record is pending, not failed. A page's lines are graded again when they aren't `current`: its
-    record or the page's tests have changed. A run graded with another gold or scorer is refused
-    (`refuse_regrading`) unless `rescore`, which grades every page again; each line and summary.json
-    say which gold and scorer graded them. Scores are written however grading ends, so an
-    interrupt keeps what was graded. A run that was never prepared is refused: its folder
-    is most likely another one (another option, another --out)."""
-    if not run.records.is_dir():
+    Grading reads predictions/ alone, and the run's `unsupported`; records add only their cost to the
+    summary, so a folder of predictions made by anything is graded the same way. It covers every page
+    of the dataset the run has a prediction for, whatever `--suites` and `--limit` chose to predict, so
+    a smaller invocation never shrinks a run's scores; a page with no prediction is pending, not failed.
+    A page's lines are graded again when they aren't `current`: its prediction or the page's tests have
+    changed. A run graded with another gold or scorer is refused (`refuse_regrading`) unless `rescore`,
+    which grades every page again; each line and summary.json say which gold and scorer graded them.
+    Scores are written however grading ends, so an interrupt keeps what was graded. A run that was never
+    prepared is refused: its folder is most likely another one (another option, another --out)."""
+    if not run.predictions.is_dir():
         raise ValueError(f"no run at {run.out}: {run.provider} with settings {run.options or 'by default'} "
-                         "was never prepared there. Check --out and --options, or prepare it first")
+                         "was never prepared there (it has no predictions/). Check --out and --options, or "
+                         "prepare it first")
+    cannot = unsupported(run)
     root, every, tests = load(dataset)
     revision = gold_revision(dataset)
     path = run.out / "scores.jsonl"
@@ -631,12 +675,12 @@ def grade(run: Run, dataset: str, rescore: bool = False, say: Callable[[str], No
     lines_of, seen, calls = {}, set(), []
     try:
         for g in every:
-            if (got := read_record(run.records / f"{g.page_id}.json")) is not None:
-                rec, text = got
-                calls += rec["calls"]
+            if (got := predicted(run, g.page_id)) is not None:
+                outputs, text = got
+                if (rec := recorded(run, g.page_id)) is not None: calls += rec["calls"]
                 had, ts = old.get(g.page_id), tests[g.page_id]
                 lines_of[g.page_id] = had if current(had, text, ts) else grade_page(
-                    run, rec, text, g, ts, revision)
+                    run, outputs, text, g, ts, revision, cannot)
             seen.add(g.page_id)
     finally:
         # Note: a page not reached yet keeps its old lines, which their stamps let the next grading check.
