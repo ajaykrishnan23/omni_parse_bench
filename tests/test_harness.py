@@ -83,7 +83,7 @@ def test_benchmark_predicts_grades_and_resumes(tmp_path, monkeypatch):
               "settings": {"kind": "text"}}]
     (data / "gold" / "a-p1.json").write_text(json.dumps({"tests": tests}))
     row = {"page_id": "a-p1", "document": "a", "suite": "a", "doc_path": "pages/a-p1.pdf",
-           "gt_path": "gold/a-p1.json"}
+           "gt_path": "gold/a-p1.json", "outputs": ["blocks", "html"]}
     pq.write_table(pa.Table.from_pylist([row]), data / "manifest.parquet")
     module = stub()
     monkeypatch.setattr(page, "adapter", lambda provider: module)
@@ -161,7 +161,7 @@ def dataset(root, n: int = 1) -> str:
              "tags": [], "args": {"content": {"text": "alpha", "max_diffs": 0}}, "settings": {}}
         (root / "gold" / f"{pid}.json").write_text(json.dumps({"tests": [t]}))
         rows.append({"page_id": pid, "document": "a", "suite": "a", "doc_path": f"pages/{pid}.pdf",
-                     "gt_path": f"gold/{pid}.json"})
+                     "gt_path": f"gold/{pid}.json", "outputs": ["html"]})
     pq.write_table(pa.Table.from_pylist(rows), root / "manifest.parquet")
     return str(root)
 

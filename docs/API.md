@@ -414,7 +414,7 @@ gold/<page_id>.json     its tests: {"tests": [...]}
 The dataset is the source of truth: a correction is an edit to a gold file, and a dropped page is
 removed with its files and its manifest row. The pages' licenses are in `licenses/`.
 
-`gold.pages` reads the manifest alone: every page, with what to predict for it (`outputs`).
+`gold.manifest` reads the manifest alone: every page, with what to predict for it (`outputs`).
 `gold.tests(root, page)` reads one page's tests. `gold.load` reads it all, checked (each needs the
 benchmark extra, for parquet):
 

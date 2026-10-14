@@ -109,7 +109,8 @@ def test_an_output_type_with_nothing_scored_is_left_out():
 
 def pages_and_tests(documents: int, per: int = 4, test_type: str = "present") -> tuple[list, list]:
     """`documents` pages, each its own document, with `per` tests each."""
-    pages = [gold.Page(f"p{k}", f"d{k}", "s", f"pages/p{k}.pdf", f"gold/p{k}.json") for k in range(documents)]
+    pages = [gold.Page(f"p{k}", f"d{k}", "s", f"pages/p{k}.pdf", f"gold/p{k}.json", ("html",))
+             for k in range(documents)]
     args = text("x") if test_type == "present" else {"cell": {"text": "x", "max_diffs": 0}}
     tests = [gold.test(f"p{i // per}", {"id": f"{test_type}{i}", "test_type": test_type,
                                         "output_type": "html", "derivation": "authored", "tags": ["table"],
