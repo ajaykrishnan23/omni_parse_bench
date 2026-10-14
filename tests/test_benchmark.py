@@ -172,7 +172,8 @@ def test_a_loop_of_ones_own_keeps_a_run_through_its_functions(tmp_path, monkeypa
     page = gold.Page("p1", "d1", "suite", "pages/p1.pdf", "gold/p1.json", ("blocks", "html"))
     want = frozenset(page.outputs)
     assert benchmark.needs(r, page) == want
-    call = {"outputs": ["html", "blocks"], "usd": 0, "wall_s": 1.0}
+    call = {"outputs": ["html", "blocks"], "usd": 0, "wall_s": 1.0,
+            "failure": {"class": "VendorTimeout", "status": None, "transient": True}}
     first = {"outputs": {"html": "<p>a</p>", "blocks": None}, "calls": [call], "raw": [],
              "errors": {"blocks": "VendorTimeout: timed out"}}
     benchmark.record(r, "p1", first)
