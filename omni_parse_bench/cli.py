@@ -42,6 +42,22 @@ def read_json(path: str) -> Any:
         raise SystemExit(f"{path} isn't JSON: {e}") from None
 
 
+def read_workers(value: str) -> int | dict:
+    """`--workers` as one number for every adapter, or a JSON object of a number per adapter or provider."""
+    try:
+        return int(value)
+    except ValueError:
+        pass
+    try:
+        out = json.loads(value)
+    except json.JSONDecodeError:
+        raise argparse.ArgumentTypeError(
+            f"--workers is a number, or a JSON object like '{{\"datalab\": 20}}', not {value!r}") from None
+    if not isinstance(out, dict):
+        raise argparse.ArgumentTypeError(f"--workers must be a number or a JSON object, not {value!r}")
+    return out
+
+
 def read_options(value: str | None) -> dict:
     """`--options` as a dict: inline JSON, or a path to a JSON file."""
     if not value: return {}
@@ -246,8 +262,10 @@ def main(argv: Sequence[str] | None = None) -> int:
                    help='per provider: {"datalab": {"mode": "balanced"}}, or a list of such dicts '
                         "for several runs")
     b.add_argument("--timeout", type=float, default=900, help="seconds per vendor call")
-    b.add_argument("--workers", type=int, default=0,
-                   help="calls at once per adapter, shared by its runs (default: a table per vendor)")
+    b.add_argument("--workers", type=read_workers, default=0, metavar="N|JSON",
+                   help="calls at once per adapter, shared by its runs: N for every adapter, or a number "
+                        'per adapter or provider, e.g. \'{"datalab": 20, "openai/gpt-5.6-sol": 3}\' '
+                        "(default: a table per vendor)")
     b.add_argument("--rescore", action="store_true", help="grade every page again, after a scorer change")
     b.add_argument("--score-only", action="store_true", help="grade what's recorded; predict nothing")
     b.add_argument("--retry-failed", action="store_true",

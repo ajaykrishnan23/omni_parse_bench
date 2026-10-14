@@ -40,7 +40,7 @@ import logging
 import os
 import threading
 import time
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from pathlib import Path
 from typing import Any, NamedTuple
 
@@ -153,7 +153,7 @@ class Plan(NamedTuple):
     pages: tuple[gold.Page, ...]
     dataset: str
     timeout: float
-    workers: int          # calls in flight per adapter; 0: `WORKERS`
+    workers: int | Mapping[str, int]   # calls in flight: one number for every adapter, or per adapter
     rescore: bool
     score_only: bool
     retry_failed: bool = False
@@ -313,11 +313,15 @@ def plan(providers: list[str], *, out: str | Path = Path("runs"), dataset: str =
          score_only: bool = False, retry_failed: bool = False, only: frozenset[str] | None = None) -> Plan:
     """Every run this invocation makes, checked before any call: a bad option or provider fails here.
 
-    `workers` is the calls in flight per adapter, shared by its runs; 0 takes `WORKERS`."""
+    `workers` is the calls in flight per adapter, shared by its runs: one number for every adapter, or
+    a number per adapter or provider (`per_adapter`); 0, or an adapter left out, takes `WORKERS`."""
     from omni_parse_bench import harness
 
-    for name, n in (("--limit", limit), ("--sample", sample), ("--workers", workers)):
+    counts = [("--limit", limit), ("--sample", sample)]
+    if isinstance(workers, int): counts.append(("--workers", workers))
+    for name, n in counts:
         if n < 0: raise ValueError(f"{name} is {n}, but it counts, so it can't be negative; 0 means no limit")
+    if isinstance(workers, Mapping): workers = per_adapter(workers)
     runs = tuple(Run(p, o, Path(out) / harness.out_name(p, o)) for p, o in configurations(providers, options))
     if twice := [r for r, n in collections.Counter(r.out.name for r in runs).items() if n > 1]:
         raise ValueError(f"run {twice[0]} is asked for more than once: the same provider with the same "
@@ -336,9 +340,34 @@ def plan(providers: list[str], *, out: str | Path = Path("runs"), dataset: str =
                 retry_failed)
 
 
-def workers_for(adapter: str, requested: int = 0) -> int:
-    """Calls in flight at once for every run of this adapter (`registry.resolve`) together."""
+def workers_for(adapter: str, requested: int | Mapping[str, int] = 0) -> int:
+    """Calls in flight at once for every run of this adapter (`registry.resolve`) together: what was
+    requested (one number for every adapter, or a number per adapter), else `WORKERS`."""
+    if isinstance(requested, Mapping): requested = requested.get(adapter, 0)
     return requested or WORKERS.get(adapter, DEFAULT_WORKERS)
+
+
+def per_adapter(workers: Mapping[str, int]) -> dict[str, int]:
+    """`--workers` given per adapter or provider, as a number per adapter: a provider names its adapter,
+    since the limit is a vendor account's, shared by every run of its adapter."""
+    from omni_parse_bench.harness import registry
+
+    adapters = {m.__name__.rsplit(".", 1)[-1] for m in registry.ADAPTERS.values()} | {"llm"}
+    out: dict[str, int] = {}
+    for key, n in workers.items():
+        if isinstance(n, bool) or not isinstance(n, int) or n < 1:
+            raise ValueError(f"--workers gives {key!r} {n!r}; calls at once is a whole number, 1 or more")
+        try:
+            a = key if key in adapters else registry.resolve(key)
+        except ValueError:
+            raise ValueError(f"--workers names {key!r}, which is no adapter or provider; the adapters are "
+                             f"{sorted(adapters)}, and a provider (e.g. openai/gpt-5.6-sol) names its own"
+                             ) from None
+        if out.get(a, n) != n:
+            raise ValueError(f"--workers gives adapter {a} two numbers, {out[a]} and {n}: its runs share one "
+                             f"pool, so name it once")
+        out[a] = n
+    return out
 
 
 def owed(p: Plan, r: Run) -> tuple[int, int]:

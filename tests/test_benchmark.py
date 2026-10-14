@@ -2,6 +2,7 @@
 and grades again, a run's dataset, and the CLI's exit codes."""
 from __future__ import annotations
 
+import argparse
 import ast
 import dataclasses
 import json
@@ -110,6 +111,23 @@ def test_runs_of_one_adapter_share_its_cap(tmp_path, monkeypatch):
     assert peak[0] <= 2, f"two runs of one adapter had {peak[0]} calls out at once, over its cap of 2"
     assert benchmark.workers_for("datalab") == benchmark.WORKERS["datalab"]
     assert benchmark.workers_for("datalab", 3) == 3 and benchmark.workers_for("unknown") == 5
+
+
+def test_workers_may_be_set_per_adapter_or_provider(tmp_path, monkeypatch):
+    """A provider names its adapter (the limit is its vendor account's); others keep their defaults."""
+    assert benchmark.per_adapter({"datalab": 20, "openai/gpt-5.6-sol": 3}) == {"datalab": 20, "llm": 3}
+    assert benchmark.workers_for("reducto", {"datalab": 20}) == benchmark.WORKERS["reducto"]
+    for bad, why in [({"nope": 2}, "no adapter or provider"), ({"datalab": 0}, "1 or more"),
+                     ({"datalab": True}, "1 or more"), ({"openai/gpt-5.6-sol": 2, "llm": 4}, "two numbers")]:
+        with pytest.raises(ValueError, match=why):
+            benchmark.per_adapter(bad)
+    assert cli.read_workers("8") == 8 and cli.read_workers('{"datalab": 20}') == {"datalab": 20}
+    with pytest.raises(argparse.ArgumentTypeError):
+        cli.read_workers("abc")
+    use(monkeypatch, {"shared": stub("shared")})
+    p = benchmark.plan(["shared"], out=tmp_path / "runs", dataset=dataset(tmp_path / "data"),
+                       workers={"shared": 7})
+    assert benchmark.workers_for("shared", p.workers) == 7
 
 
 # 2. An account failure stops its adapter's runs, and only those.
