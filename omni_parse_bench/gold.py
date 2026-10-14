@@ -54,7 +54,7 @@ MANIFEST = "manifest.parquet"
 # Note: the dataset's commits before 41131f2 (175cc91, 1c35a52) have no outputs column; omni-parse-bench
 # 0.1.x reads them.
 OLD_DATASET = (
-    "the dataset at {root} is from before omni-parse-bench 0.2.0: its manifest has no 'outputs' column "
+    "the dataset at {root} is from before omni-parse-bench 0.1.2: its manifest has no 'outputs' column "
     "(the dataset's commits 1c35a52 and earlier). Use the current dataset:\n"
     "  - from Hugging Face: drop the @<commit> pin, i.e. --dataset hf://datasets/datalab-to/omni_parse_bench;\n"
     "  - a downloaded copy: download it again: "

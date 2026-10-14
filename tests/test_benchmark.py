@@ -310,7 +310,7 @@ def test_a_dataset_from_before_outputs_says_how_to_get_the_current_one(tmp_path)
     data = dataset(tmp_path / "data")
     table = pq.read_table(pathlib.Path(data) / "manifest.parquet")
     pq.write_table(table.drop_columns(["outputs"]), pathlib.Path(data) / "manifest.parquet")
-    with pytest.raises(gold.GoldError, match="from before omni-parse-bench 0.2.0") as e:
+    with pytest.raises(gold.GoldError, match="from before omni-parse-bench 0.1.2") as e:
         gold.manifest(data)
     for fix in ("hf://datasets/datalab-to/omni_parse_bench", "hf download datalab-to/omni_parse_bench",
                 "pip install 'omni-parse-bench==0.1.1'"):
