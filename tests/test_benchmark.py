@@ -725,8 +725,7 @@ def test_a_changed_prediction_is_graded_and_the_record_is_not_read(tmp_path, mon
     assert s["html"]["score"] == 1.0
     (run,) = p.runs
     (run.predictions / "a-p0.json").write_text(json.dumps({"html": "<p>beta</p>"}))
-    monkeypatch.setattr(benchmark, "read_record", lambda path: pytest.fail("grading read a record"))
-    monkeypatch.setattr(benchmark, "recorded", lambda run, page_id: None)
+    monkeypatch.setattr(benchmark, "recorded", lambda run, page_id: None)     # as if it had no records
     assert benchmark.grade(run, p.dataset, say=QUIET)["html"]["score"] == 0.0
 
 

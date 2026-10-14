@@ -140,8 +140,20 @@ def prepare(run: Run, dataset: str, timeout: float) -> None:
 
 
 def recorded(run: Run, page_id: str) -> dict | None:
-    """What the run has recorded for the page, or None when nothing (or nothing readable)."""
-    return None if (got := read_record(run.records / f"{page_id}.json")) is None else got[0]
+    """The page's record, the audit trail of its calls (`records/`), or None when it has none (or none
+    readable)."""
+    got = _read(run.records / f"{page_id}.json",
+                lambda r: isinstance(r, dict) and isinstance(r.get("outputs"), dict) and "calls" in r,
+                "a record")
+    return None if got is None else got[0]
+
+
+def predicted(run: Run, page_id: str) -> tuple[dict, str] | None:
+    """The page's outputs (`predictions/`), `{output type: its value, or None when it failed}`, and the
+    digest of their file, which grading stamps; None when it has none (or none readable)."""
+    return _read(run.predictions / f"{page_id}.json",
+                 lambda o: isinstance(o, dict) and set(o) <= set(vocab.OUTPUT_TYPES),
+                 f"a prediction (an object whose keys are among {list(vocab.OUTPUT_TYPES)})")
 
 
 def needs(run: Run, page: gold.Page, retry_failed: bool = False) -> frozenset[str]:
@@ -390,7 +402,7 @@ def owed(p: Plan, r: Run) -> tuple[int, int]:
     predict = grade = 0
     for g in p.pages:
         coming = not p.score_only and bool(needs(r, g, p.retry_failed))
-        got = read_prediction(r.predictions / f"{g.page_id}.json")
+        got = predicted(r, g.page_id)
         predict += coming
         grade += coming or (got is not None and not current(rows.get(g.page_id), got[1], tests[g.page_id]))
     return predict, grade
@@ -426,39 +438,21 @@ def read_json(path: Path) -> Any:
         return None
 
 
-def read_record(path: Path) -> tuple[dict, str] | None:
-    """A record and the digest of its text, or None when it's absent or unreadable (logged), which
-    makes its page one not predicted."""
+def _read(path: Path, valid: Callable[[Any], bool], what: str) -> tuple[Any, str] | None:
+    """A run file's contents and the digest of its text; None when it's absent, or unreadable or not
+    `what` (logged), which makes its page one not predicted."""
     try:
         text = path.read_text()
-        record = json.loads(text)
+        got = json.loads(text)
     except FileNotFoundError:
         return None
     except (json.JSONDecodeError, UnicodeDecodeError) as exc:
         log.warning("%s isn't readable JSON (%s); its page counts as not predicted", path, exc)
         return None
-    if not (isinstance(record, dict) and isinstance(record.get("outputs"), dict) and "calls" in record):
-        log.warning("%s isn't a record; its page counts as not predicted", path)
+    if not valid(got):
+        log.warning("%s isn't %s; its page counts as not predicted", path, what)
         return None
-    return record, digest(text)
-
-
-def read_prediction(path: Path) -> tuple[dict, str] | None:
-    """A page's prediction, `{output type: its value, or None when it failed}`, and the digest of its
-    text; None when it's absent or unreadable (logged), which makes its page one not predicted."""
-    try:
-        text = path.read_text()
-        outputs = json.loads(text)
-    except FileNotFoundError:
-        return None
-    except (json.JSONDecodeError, UnicodeDecodeError) as exc:
-        log.warning("%s isn't readable JSON (%s); its page counts as not predicted", path, exc)
-        return None
-    if not (isinstance(outputs, dict) and set(outputs) <= set(vocab.OUTPUT_TYPES)):
-        log.warning("%s isn't a prediction (an object whose keys are among %s); its page counts as not "
-                    "predicted", path, list(vocab.OUTPUT_TYPES))
-        return None
-    return outputs, digest(text)
+    return got, digest(text)
 
 
 def unsupported(run: Run) -> frozenset[str]:
@@ -677,7 +671,7 @@ def grade(run: Run, dataset: str, rescore: bool = False, say: Callable[[str], No
     lines_of, seen, calls = {}, set(), []
     try:
         for g in every:
-            if (got := read_prediction(run.predictions / f"{g.page_id}.json")) is not None:
+            if (got := predicted(run, g.page_id)) is not None:
                 outputs, text = got
                 if (rec := recorded(run, g.page_id)) is not None: calls += rec["calls"]
                 had, ts = old.get(g.page_id), tests[g.page_id]

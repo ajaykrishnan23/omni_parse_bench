@@ -350,9 +350,10 @@ benchmark.grade(run, p.dataset)
   everything every time can skip `needs`; it is what makes a loop resumable;
 - `record(run, page_id, result)` writes: it merges a new result (a record from `predict`) into what
   the run has for the page, writes it and its prediction, and returns what it kept;
-- `recorded(run, page_id)` reads: what the run has recorded for the page, or None; and
-- `grade(run, dataset)` grades the pages recorded so far, writes `scores.jsonl` and `summary.json`, and
-  returns the summary. A page with no record is pending, not failed; a run never prepared is refused.
+- `recorded(run, page_id)` reads the page's record (its calls, for an audit), or None;
+- `predicted(run, page_id)` reads the page's outputs and their digest, or None: what grading reads; and
+- `grade(run, dataset)` grades the pages predicted so far, writes `scores.jsonl` and `summary.json`, and
+  returns the summary. A page with no prediction is pending, not failed; a run never prepared is refused.
 
 The folder is then exactly one `opb benchmark` writes, so either can resume or grade it.
 
