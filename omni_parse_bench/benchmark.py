@@ -13,9 +13,8 @@ no vendor call. Each page is asked for exactly the outputs its tests read.
 
 A run directory holds:
 
-    settings.json                what the run is: provider, settings, dataset, gold and timeout
-    records/<page_id>.json       what `predict` returned: outputs, errors, calls, raw responses, and
-                                 a digest of the page file
+    settings.json                what the run asks: provider, settings, dataset (and commit), timeout
+    records/<page_id>.json       what `predict` returned: outputs, errors, calls, raw responses
     predictions/<page_id>.json   the outputs alone, which scoring reads
     scores.jsonl                 one line per test: its verdict, what the test is (page, suite,
                                  document, type, tags, ...), and the stamps of what graded it
@@ -139,9 +138,9 @@ def needs(run: Run, page: gold.Page, retry_failed: bool = False) -> frozenset[st
 
 
 def record(run: Run, page_id: str, new: dict) -> dict:
-    """A new record of the page made part of the run, and returned: merged into the old one when both
-    are of the same page file (`merged`), else in its place; its outputs written to predictions/, then
-    the record itself."""
+    """A new record of the page made part of the run, and returned: merged into the old one if any
+    (`merged`: the outputs asked again take the new outcome, every call is kept), its outputs written to
+    predictions/, then the record itself."""
     old = recorded(run, page_id)
     kept = merged(old, new) if old is not None else new
     write_json(run.predictions / f"{page_id}.json", kept["outputs"])
@@ -220,16 +219,16 @@ def gold_revision(dataset: str) -> str:
     return h.hexdigest()[:16]
 
 
-def graded_with(run: Run) -> frozenset[tuple[str | None, str | None]]:
-    """The (gold, scorer) pairs the run's score lines were graded with; none before its first grading."""
-    return frozenset((x.get("gold"), x.get("scorer"))
-                     for xs in read_scores(run.out / "scores.jsonl").values() for x in xs)
+def graded_with(scores: dict[str, list[dict]]) -> frozenset[tuple[str | None, str | None]]:
+    """The (gold, scorer) pairs a run's score lines (`read_scores`) were graded with; none before its
+    first grading."""
+    return frozenset((x.get("gold"), x.get("scorer")) for xs in scores.values() for x in xs)
 
 
-def refuse_regrading(run: Run, revision: str) -> None:
-    """Refuses a run graded with another gold or scorer than this one: grading it again would change
-    its scores, which only `--rescore` does, every page at once, never a mix of the two."""
-    if stale := sorted(graded_with(run) - {(revision, SCORER)}, key=str):
+def refuse_regrading(run: Run, revision: str, scores: dict[str, list[dict]]) -> None:
+    """Refuses a run whose score lines were graded with another gold or scorer than this one: grading
+    it again would change its scores, which only `--rescore` does, every page at once, never a mix."""
+    if stale := sorted(graded_with(scores) - {(revision, SCORER)}, key=str):
         was = ", ".join(f"gold {g} with scorer {s}" for g, s in stale)
         raise ValueError(f"{run.out} was graded against {was}; this is gold {revision} with scorer "
                          f"{SCORER}. Pass --rescore to grade every page again with these (no page is "
@@ -247,7 +246,7 @@ def manifest(dataset: str) -> tuple[Path, tuple[gold.Page, ...]]:
 @functools.cache
 def load(dataset: str) -> tuple[Path, tuple[gold.Page, ...], dict[str, tuple[gold.Test, ...]]]:
     """The dataset's folder, its pages, and each page's tests by page id; read once per process."""
-    root = dataset_root(dataset)
+    root, _ = manifest(dataset)
     ps, ts = gold.load(root)
     return root, ps, gold.by_page(ts)
 
@@ -266,13 +265,13 @@ def page_file(dataset: str, root: Path, doc_path: str) -> Path:
 
 
 def pages(dataset: str, suites: list[str] | None = None, limit: int = 0,
-          sample: int = 0, only: frozenset[str] | None = None) -> tuple[Path, tuple[gold.Page, ...]]:
-    """The dataset's folder and its pages, in manifest order, filtered by suite and by `only` (page
-    ids, each of which must be in the dataset), and limited.
+          sample: int = 0, only: frozenset[str] | None = None) -> tuple[gold.Page, ...]:
+    """The dataset's pages, in manifest order, filtered by suite and by `only` (page ids, each of which
+    must be in the dataset), and limited.
 
     `sample` picks that many pages spread over every suite: suites in turn, each page evenly spaced
     within its suite, so a smoke test sees every kind of page and the same pages each time."""
-    root, rows = manifest(str(dataset))
+    _, rows = manifest(str(dataset))
     known = {r.suite for r in rows}
     if bad := sorted(set(suites or ()) - known):
         raise ValueError(f"unknown suites {bad}; the dataset's suites are {sorted(known)}")
@@ -290,7 +289,7 @@ def pages(dataset: str, suites: list[str] | None = None, limit: int = 0,
         turns = [x for i in range(k) for xs in spread if i < len(xs) for x in [xs[i]]]
         chosen = {r.page_id for r in turns[:sample]}
         rows = tuple(r for r in rows if r.page_id in chosen)
-    return root, rows[:limit] if limit else rows
+    return rows[:limit] if limit else rows
 
 
 def configurations(providers: list[str], options: dict | None = None) -> list[tuple[str, dict]]:
@@ -324,7 +323,7 @@ def plan(providers: list[str], *, out: str | Path = Path("runs"), dataset: str =
         raise ValueError(f"run {twice[0]} is asked for more than once: the same provider with the same "
                          "settings (an option set to its default is the same setting); drop the repeat from "
                          "--providers or --options")
-    _, ps = pages(dataset, suites, limit, sample, only)
+    ps = pages(dataset, suites, limit, sample, only)
     ident = dataset_id(dataset)
     for r in runs:
         if (was := (read_json(r.out / "settings.json") or {}).get("dataset", ident)) != ident:
@@ -332,7 +331,7 @@ def plan(providers: list[str], *, out: str | Path = Path("runs"), dataset: str =
                              f"datasets; pass another --out, or --dataset {was}")
     # Note: refused here, before any call, not after hours of predictions; grade checks again.
     if not rescore and any((r.out / "scores.jsonl").exists() for r in runs):
-        for r in runs: refuse_regrading(r, gold_revision(str(dataset)))
+        for r in runs: refuse_regrading(r, gold_revision(str(dataset)), read_scores(r.out / "scores.jsonl"))
     return Plan(runs, ps, str(dataset), timeout or harness.DEFAULT_TIMEOUT, workers, rescore, score_only,
                 retry_failed)
 
@@ -376,11 +375,10 @@ def owed(p: Plan, r: Run) -> tuple[int, int]:
     rows = {} if p.rescore else read_scores(r.out / "scores.jsonl")
     predict = grade = 0
     for g in p.pages:
+        coming = not p.score_only and bool(needs(r, g, p.retry_failed))
         got = read_record(r.records / f"{g.page_id}.json")
-        record, text = got if got is not None else (None, "")
-        coming = not p.score_only and bool(missing(record, frozenset(g.outputs), p.retry_failed))
         predict += coming
-        grade += coming or (record is not None and not current(rows.get(g.page_id), text, tests[g.page_id]))
+        grade += coming or (got is not None and not current(rows.get(g.page_id), got[1], tests[g.page_id]))
     return predict, grade
 
 
@@ -658,9 +656,9 @@ def grade(run: Run, dataset: str, rescore: bool = False, say: Callable[[str], No
                          "was never prepared there. Check --out and --options, or prepare it first")
     root, every, tests = load(dataset)
     revision = gold_revision(dataset)
-    if not rescore: refuse_regrading(run, revision)
     path = run.out / "scores.jsonl"
     old = {} if rescore else read_scores(path)
+    refuse_regrading(run, revision, old)
     lines_of, seen, calls = {}, set(), []
     try:
         for g in every:
