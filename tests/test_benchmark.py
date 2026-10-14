@@ -168,20 +168,18 @@ def test_a_loop_of_ones_own_keeps_a_run_through_its_functions(tmp_path, monkeypa
     benchmark.prepare(r, "some/dataset", 900.0)
     assert json.loads((r.out / "settings.json").read_text())["gold"] == "gold-1"
     want = frozenset({"html", "blocks"})
-    assert benchmark.needs(r, "p1", want, "sha-a") == want
+    assert benchmark.needs(r, "p1", want) == want
     call = {"outputs": ["html", "blocks"], "usd": 0, "wall_s": 1.0}
     first = {"outputs": {"html": "<p>a</p>", "blocks": None}, "calls": [call], "raw": [],
-             "errors": {"blocks": "VendorTimeout: timed out"}, "page_sha256": "sha-a"}
+             "errors": {"blocks": "VendorTimeout: timed out"}}
     benchmark.record(r, "p1", first)
     assert json.loads((r.predictions / "p1.json").read_text()) == {"html": "<p>a</p>", "blocks": None}
-    assert benchmark.needs(r, "p1", want, "sha-a") == frozenset()
-    assert benchmark.needs(r, "p1", want, "sha-a", retry_failed=True) == frozenset({"blocks"})
-    again = {"outputs": {"blocks": []}, "errors": {}, "calls": [call], "raw": [], "page_sha256": "sha-a"}
+    assert benchmark.needs(r, "p1", want) == frozenset()
+    assert benchmark.needs(r, "p1", want, retry_failed=True) == frozenset({"blocks"})
+    again = {"outputs": {"blocks": []}, "errors": {}, "calls": [call], "raw": []}
     kept = benchmark.record(r, "p1", again)
     assert kept["outputs"] == {"html": "<p>a</p>", "blocks": []} and kept["errors"] == {}
     assert len(kept["calls"]) == 2 and benchmark.recorded(r, "p1") == kept
-    assert benchmark.needs(r, "p1", want, "sha-b") == want  # another page file: all of it again
-    assert benchmark.record(r, "p1", first | {"page_sha256": "sha-b"})["calls"] == [call]
 
 
 def test_a_run_never_prepared_is_not_graded(tmp_path):
@@ -236,25 +234,19 @@ def test_each_call_keeps_the_timeout_it_ran_under(tmp_path, monkeypatch):
     assert [c["timeout_s"] for c in rec["calls"]] == [5, 7] and rec["timeout_s"] == 7
 
 
-def test_a_changed_page_file_is_predicted_again(tmp_path, monkeypatch):
+def test_a_page_already_answered_is_not_fetched_again(tmp_path, monkeypatch):
+    """A run folder assumes its pages don't change, so a resume reads records, not page files."""
     calls = []
     use(monkeypatch, {"stub": stub(call=lambda config: calls.append(1) or contract.Call({"html": "alpha"}))})
     data = dataset(tmp_path / "data")
     p = benchmark.plan(["stub"], out=tmp_path / "runs", dataset=data)
     benchmark.execute(p, say=QUIET)
-    pdf = pathlib.Path(data) / "pages" / "a-p0.pdf"
-    assert saved(p.runs[0])["page_sha256"] == benchmark.file_digest(pdf)
+    fetched = []
+    real = benchmark.page_file
+    monkeypatch.setattr(benchmark, "page_file", lambda *a: fetched.append(a) or real(*a))
+    (pathlib.Path(data) / "pages" / "a-p0.pdf").write_bytes(b"%PDF another page")
     benchmark.execute(p, say=QUIET)
-    assert len(calls) == 1
-    pdf.write_bytes(b"%PDF another page")
-    benchmark.execute(p, say=QUIET)
-    assert len(calls) == 2, "a record of another page file is not this page's"
-    old = saved(p.runs[0])
-    del old["page_sha256"]
-    benchmark.write_json(p.runs[0].records / "a-p0.json", old)
-    pdf.write_bytes(b"%PDF yet another")
-    benchmark.execute(p, say=QUIET)
-    assert len(calls) == 2, "a record from before page digests is trusted"
+    assert len(calls) == 1 and fetched == []
 
 
 # 5. The plan counts what will be predicted.
@@ -266,11 +258,11 @@ def test_the_plan_counts_what_will_be_predicted(tmp_path, monkeypatch):
     p = benchmark.plan(["stub"], out=tmp_path / "runs", dataset=data)
     (run,) = p.runs
     revision = benchmark.gold_revision(data, pathlib.Path(data))
-    assert benchmark.owed(p, run, revision, lambda g: None) == (1, 1)
+    assert benchmark.owed(p, run, revision) == (1, 1)
     benchmark.execute(p, say=QUIET)
     assert saved(run)["errors"]["blocks"] == "unsupported"
-    assert benchmark.owed(p, run, revision, lambda g: None) == (0, 0), "an unsupported output is settled"
-    assert benchmark.owed(p._replace(retry_failed=True), run, revision, lambda g: None) == (1, 1)
+    assert benchmark.owed(p, run, revision) == (0, 0), "an unsupported output is settled"
+    assert benchmark.owed(p._replace(retry_failed=True), run, revision) == (1, 1)
     assert "predict" in benchmark.describe(p)
 
 
