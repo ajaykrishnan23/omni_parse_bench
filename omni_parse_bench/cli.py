@@ -25,7 +25,7 @@ from collections.abc import Sequence
 from pathlib import Path
 from typing import Any
 
-from omni_parse_bench import benchmark
+from omni_parse_bench import benchmark, progress
 
 # command -> the extra it needs; `score` needs none.
 EXTRAS = {"predict": "harness", "providers": "harness", "reparse": "harness", "benchmark": "benchmark",
@@ -149,7 +149,7 @@ def confirm_plan(plan: Any) -> bool:
     """
     from rich.console import Console
 
-    Console(stderr=True, highlight=False).print(benchmark.plan_view(plan))
+    Console(stderr=True, highlight=False).print(progress.plan_view(plan))
     if not sys.stdin.isatty():
         return True
     try:

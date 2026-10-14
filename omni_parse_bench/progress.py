@@ -1,4 +1,5 @@
-"""A live table while the benchmark runs, and a log line per provider when there is no tty.
+"""What the terminal shows of a benchmark: the plan before it runs (`plan_view`), then a live table while
+it runs, and a log line per provider when there is no tty.
 
      run                                       done    ok   err   in flight     cost     avg     dur
     ──────────────────────────────────────────────────────────────────────────────────────────────
@@ -42,6 +43,8 @@ from rich.live import Live
 from rich.progress_bar import ProgressBar
 from rich.table import Table
 from rich.text import Text
+
+from omni_parse_bench import benchmark
 
 log = logging.getLogger(__name__)
 
@@ -397,3 +400,72 @@ class _Interleaved(logging.Handler):
             return
         with self.progress.lock:
             console.print(self.inner.format(record), highlight=False, markup=False)
+
+
+# The plan, before a benchmark runs: `opb benchmark` shows it, and `benchmark.describe` writes it.
+
+PLAN_WIDTH = 110
+
+
+def facts(p: benchmark.Plan):
+    """What this invocation is, one labelled row each."""
+    from rich.table import Table
+    from rich.text import Text
+
+    from omni_parse_bench import harness
+
+    table = Table(box=None, show_header=False, pad_edge=False)
+    table.add_column("", style="dim", no_wrap=True)
+    table.add_column("", overflow="fold")
+    table.add_row("out", str(p.runs[0].out.parent) if p.runs else "")
+    table.add_row("runs", str(len(p.runs)))
+    table.add_row("dataset", p.dataset)
+    table.add_row("pages", str(len(p.pages)))
+    table.add_row("timeout", f"{p.timeout:.0f}s per call")
+    adapters = sorted({harness.resolve(r.provider) for r in p.runs})
+    table.add_row("at once", ", ".join(f"{a} {benchmark.workers_for(a, p.workers)}" for a in adapters)
+                  + " calls, shared by an adapter's runs")
+    # Note: shown even when false: `score only  false` is what says this will spend money.
+    for name, on in (("score only", p.score_only), ("rescoring", p.rescore)):
+        table.add_row(name, Text(str(on).lower(), style="bold" if on else "dim"))
+    return table
+
+
+def plan_view(p: benchmark.Plan):
+    """The whole plan as one renderable: each run, its settings, and what it still owes."""
+    from rich import box
+    from rich.console import Group
+    from rich.rule import Rule
+    from rich.table import Table
+    from rich.text import Text
+
+    from omni_parse_bench import harness
+
+    table = Table(box=box.ROUNDED, header_style="dim", expand=False)
+    table.add_column("adapter", overflow="fold")
+    table.add_column("run", overflow="fold")
+    table.add_column("settings", overflow="fold")
+    table.add_column("predict", justify="right", no_wrap=True)
+    table.add_column("grade", justify="right", no_wrap=True)
+    for r in p.runs:
+        to_predict, to_grade = benchmark.owed(p, r)
+        settings = [f"{k}={v}" for k, v in harness.settings_for(r.provider, r.options).items()]
+        cell: list = []
+        for n, x in enumerate(settings):
+            if n: cell.append(Rule(style="dim"))
+            cell.append(Text(x, style="cyan"))
+        table.add_row(Text(harness.resolve(r.provider), style="bold"), Text(r.out.name), Group(*cell),
+                      Text(str(to_predict), style="bold" if to_predict else ""),
+                      Text(str(to_grade), style="bold" if to_grade else ""), end_section=True)
+    return Group(Text("benchmark", style="bold"), facts(p), Text(""), table)
+
+
+def describe(p: benchmark.Plan) -> str:
+    """`plan_view` as plain text, for a log that has no colour and no width to ask about."""
+    import io
+
+    from rich.console import Console
+
+    console = Console(file=io.StringIO(), width=PLAN_WIDTH, no_color=True, highlight=False)
+    console.print(plan_view(p))
+    return "\n".join(line.rstrip() for line in console.file.getvalue().splitlines())
