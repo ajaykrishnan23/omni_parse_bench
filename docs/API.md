@@ -277,8 +277,9 @@ It's resumable, and safe to run twice.
 - A page is predicted again only for the outputs its record doesn't hold; an output recorded as
   unsupported is held. The record is written last, so its presence means the prediction beside it
   is complete;
-- a page whose file has changed since its record (the record's `page_sha256`) is predicted again
-  whole; a record from before page digests is trusted;
+- a run folder assumes its pages don't change under it: a page with a record is not fetched again,
+  and pages are pinned to a dataset commit and never edited in place. To predict again after a
+  dataset's pages change, use a new `--out`;
 - a record that isn't readable JSON counts as not predicted, and is logged;
 - a page is graded again when its lines in `scores.jsonl` are missing, unreadable or out of date: its
   record, the gold or the scorer version differs, or the page's test ids have changed;
@@ -299,6 +300,51 @@ An output whose answer arrived but didn't parse is fixed for free: after a parsi
 `opb reparse RUN_DIR` reads every record's outputs again from its saved answers, and
 `opb benchmark ... --score-only --rescore` grades them.
 
+### A loop of your own
+
+`opb benchmark` is one loop over pages. To predict elsewhere (on another machine, on a GPU cluster, on
+a scheduler) and still get the same run folder, keep the run with the functions `opb benchmark` uses
+itself. A `benchmark.Run` is an address, as a `Path` is: what the run holds is whatever its folder
+holds when it is read.
+
+```python
+from omni_parse_bench import benchmark, gold, harness
+
+p = benchmark.plan(["dots-mocr"], out="runs")
+(run,) = p.runs
+root, _, tests = benchmark.load(p.dataset)
+benchmark.prepare(run, p.dataset, p.timeout)
+for page in p.pages:
+    if need := benchmark.needs(run, page.page_id, gold.wants(tests[page.page_id])):
+        file = benchmark.page_file(p.dataset, root, page.doc_path)
+        result = harness.predict(run.provider, file, need, timeout=p.timeout, **run.options)  # wherever
+        benchmark.record(run, page.page_id, result)
+benchmark.grade(run, p.dataset)
+```
+
+- `prepare(run, dataset, timeout)` makes the folder and writes `settings.json`;
+- `needs(run, page_id, want, retry_failed=False)` is the outputs to ask `predict` for, and is
+  passed to it as they are. `want` is what the page's tests read (`gold.wants`, usually `{"html",
+  "blocks"}`); `needs` is the part of it the page's record doesn't settle:
+
+  | the page's record | `needs` returns |
+  | --- | --- |
+  | none yet | all of `want` |
+  | without an output, never asked (a gold that added layout tests later; one of an LLM's separate calls cut short) | that output |
+  | with an output failed in a way that may not recur (a timeout, an outage, a 429 or 5xx), with `retry_failed=True` | that output |
+  | with an output recorded as unsupported | nothing for it |
+  | holding all of `want` | nothing, so the page is skipped |
+
+  A page has several outputs, often from separate, paid calls, so the answer is a set, not a yes or no:
+  a resume, `--retry-failed` or a new kind of test asks for what is missing only. A loop that asks for
+  everything every time can skip `needs`; it is what makes a loop resumable;
+- `record(run, page_id, result)` writes: it merges a new result (a record from `predict`) into what
+  the run has for the page, writes it and its prediction, and returns what it kept;
+- `recorded(run, page_id)` reads: what the run has recorded for the page, or None; and
+- `grade(run, dataset)` grades the pages recorded so far, writes `scores.jsonl` and `summary.json`, and
+  returns the summary. A page with no record is pending, not failed; a run never prepared is refused.
+
+The folder is then exactly one `opb benchmark` writes, so either can resume or grade it.
 
 ## providers
 
@@ -540,9 +586,9 @@ and cost:
 ### records/&lt;page_id&gt;.json
 
 Everything about one page's prediction: the record `predict` returns (outputs, errors, calls, raw
-answers, settings), with the time it was captured, and `page_sha256`, the digest of the page file it
-read. Each call keeps its timeout (`timeout_s`) and its failure (`class`, `status`, `transient`),
-which `--retry-failed` reads. The raw answers are what `opb reparse` reads.
+answers, settings), with the time it was captured. Each call keeps its timeout (`timeout_s`) and its
+failure (`class`, `status`, `transient`), which `--retry-failed` reads. The raw answers are what
+`opb reparse` reads. A record from before this version may also hold `page_sha256`; it is ignored.
 
 ### predictions/&lt;page_id&gt;.json
 
