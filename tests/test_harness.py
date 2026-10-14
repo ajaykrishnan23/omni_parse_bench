@@ -111,14 +111,15 @@ def test_opb_providers_lists_an_adapters_options(capsys):
     (["providers"], "rich", "harness"),
     (["tests", "--dataset", "hf://datasets/x/y"], "huggingface_hub", "benchmark"),
 ])
-def test_opb_names_the_extra_a_core_install_lacks(monkeypatch, capsys, argv, module, extra):
-    """On an install without the command's extra, opb says which extra to add, not a traceback."""
+def test_opb_names_the_extra_a_core_install_lacks(monkeypatch, argv, module, extra):
+    """On an install without the command's extra, opb's error says which extra to add."""
     from omni_parse_bench import cli
 
     monkeypatch.setitem(sys.modules, module, None)   # importing it now raises ImportError
-    assert cli.main(argv) == 1
-    err = capsys.readouterr().err
-    assert f"opb {argv[0]} needs {module}" in err and f"pip install 'omni-parse-bench[{extra}]'" in err
+    with pytest.raises(ImportError) as e:
+        cli.main(argv)
+    assert f"opb {argv[0]} needs {module}" in str(e.value)
+    assert f"pip install 'omni-parse-bench[{extra}]'" in str(e.value)
 
 
 def test_tesseract_writes_its_text_as_escaped_html():

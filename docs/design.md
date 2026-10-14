@@ -130,6 +130,7 @@ gold/<page_id>.json    the page's tests
 | `suite` | `realdoc_pdfs` | where the page came from; its license is in `licenses/`. `--suites` filters on it |
 | `doc_path` | `pages/<page_id>.pdf` | the input, relative to the dataset root: a `.pdf` or a `.png` |
 | `gt_path` | `gold/<page_id>.json` | the tests, relative to the dataset root |
+| `outputs` | `["html", "blocks"]` | what to predict for the page: the output types its tests read, so planning a run reads the manifest alone. Made from the gold when the dataset is published, and checked against it whenever the gold is read; a manifest from before the column has it read from the gold |
 
 The 2,937 pages come from 2,343 documents.
 
@@ -194,8 +195,9 @@ suite and document are its page's.
 predict(provider, page, wants=None, timeout=…, **options) -> record   # page: a .pdf or .png
 ```
 
-The benchmark asks a provider only for what a page's tests read: it collects the `output_type` of
-every test on the page (`gold.wants`) and calls `predict` with those as `wants`. The record holds
+The benchmark asks a provider only for what a page's tests read: the page's `outputs` in the
+manifest, the `output_type` of every test on it (`gold.wants`), less what its record already holds,
+are the `wants` it calls `predict` with. The record holds
 the outputs, an error per output that failed or is unsupported, each call (what was sent, its cost
 and time) and the vendor's raw answers; [API.md](./API.md) shows one.
 

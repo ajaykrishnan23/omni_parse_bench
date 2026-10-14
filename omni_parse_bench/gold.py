@@ -47,6 +47,10 @@ from typing import Any, NamedTuple
 from omni_parse_bench import equations, normalize, runners, vocab
 
 PAGE_FIELDS = ("page_id", "document", "suite", "doc_path", "gt_path")
+# Note: a manifest from before outputs were stored lacks the column; its pages' outputs are read from
+# their gold, so every commit of a dataset stays readable.
+OPTIONAL_PAGE_FIELDS = ("outputs",)
+OUTPUTS = frozenset(vocab.READS.values())     # the output types a test can read: html, blocks
 FIELDS = ("id", "test_type", "output_type", "derivation", "tags", "args", "settings")
 MANIFEST = "manifest.parquet"
 _DOC_PATH = re.compile(r"pages/(.+)\.(?:pdf|png)")
@@ -82,6 +86,9 @@ class Page(NamedTuple):
     suite: str
     doc_path: str   # the page file: pages/<page_id>.pdf or .png
     gt_path: str    # its tests: gold/<page_id>.json
+    # What to predict: the output types its tests read (`wants`), sorted. None only for a row read from
+    # a manifest without the column, until its gold is read.
+    outputs: tuple[str, ...] | None = None
 
 
 class Test(NamedTuple):
@@ -94,27 +101,67 @@ class Test(NamedTuple):
     params: tuple   # the test type's parameter NamedTuple (`runners.TYPES`)
 
 
-def load(root: str | Path) -> tuple[tuple[Page, ...], tuple[Test, ...]]:
-    """Every page of the dataset folder `root` and every test, checked, each page's tests in its
-    gold file's order."""
+def manifest(root: str | Path) -> tuple[Page, ...]:
+    """The manifest's rows, checked; `outputs` is None on each row when the manifest lacks it."""
     try:
         import pyarrow.parquet as pq
     except ImportError:
-        raise ImportError("gold.load reads the manifest with pyarrow: "
+        raise ImportError("gold reads the manifest with pyarrow: "
                           "pip install 'omni-parse-bench[benchmark]'") from None
-    root = Path(root).expanduser()
-    pages = tuple(page(r) for r in pq.read_table(root / MANIFEST).to_pylist())
-    if twice := [i for i, n in collections.Counter(p.page_id for p in pages).items() if n > 1]:
+    table = pq.read_table(Path(root).expanduser() / MANIFEST)
+    if unknown := [c for c in table.column_names if c not in (*PAGE_FIELDS, *OPTIONAL_PAGE_FIELDS)]:
+        raise GoldError(f"the dataset's manifest has columns this omni-parse-bench ({_version()}) doesn't "
+                        f"know: {unknown}. The dataset is newer than this omni-parse-bench; upgrade it: "
+                        f"pip install -U omni-parse-bench")
+    rows = tuple(page(r) for r in table.to_pylist())
+    if twice := [i for i, n in collections.Counter(p.page_id for p in rows).items() if n > 1]:
         raise GoldError(f"{len(twice)} page ids are in the manifest more than once, e.g. {twice[:3]}")
-    named = {Path(p.gt_path).name for p in pages}
+    return rows
+
+
+def _version() -> str:
+    import importlib.metadata
+
+    try:
+        return importlib.metadata.version("omni-parse-bench")
+    except importlib.metadata.PackageNotFoundError:
+        return "unknown version"
+
+
+def pages(root: str | Path) -> tuple[Page, ...]:
+    """Every page of the dataset folder `root`, with what to predict for it: from the manifest alone
+    when it says (no gold file is read), else from the gold (`load`)."""
+    rows = manifest(root)
+    return rows if all(p.outputs is not None for p in rows) else load(root)[0]
+
+
+def tests(root: str | Path, p: Page) -> tuple[Test, ...]:
+    """One page's tests, from its gold file alone; refuses a page whose manifest `outputs` disagree
+    with what its tests read."""
+    ts = read(Path(root).expanduser() / p.gt_path)
+    if p.outputs is not None and frozenset(p.outputs) != wants(ts):
+        raise GoldError(f"page {p.page_id!r}: the manifest says it is asked for {list(p.outputs)}, but its "
+                        f"tests read {sorted(wants(ts))}; the manifest is out of step with the gold")
+    return ts
+
+
+def load(root: str | Path) -> tuple[tuple[Page, ...], tuple[Test, ...]]:
+    """Every page of the dataset folder `root` and every test, checked, each page's tests in its
+    gold file's order. A page's `outputs` is checked against its tests, or read from them when the
+    manifest lacks the column."""
+    root = Path(root).expanduser()
+    rows = manifest(root)
+    named = {Path(p.gt_path).name for p in rows}
     if stray := sorted(f.name for f in (root / "gold").glob("*.json") if f.name not in named):
         raise GoldError(f"{len(stray)} gold files have no manifest row, e.g. {stray[:3]}")
-    tests = tuple(t for p in pages for t in read(root / p.gt_path))
-    if twice := [i for i, n in collections.Counter(t.id for t in tests).items() if n > 1]:
+    got = [(p, tests(root, p)) for p in rows]
+    ps = tuple(p if p.outputs is not None else p._replace(outputs=tuple(sorted(wants(ts)))) for p, ts in got)
+    every = tuple(t for _, ts in got for t in ts)
+    if twice := [i for i, n in collections.Counter(t.id for t in every).items() if n > 1]:
         raise GoldError(f"{len(twice)} test ids are used more than once, e.g. {twice[:3]}")
-    if empty := sorted({p.page_id for p in pages} - {t.page_id for t in tests}):
+    if empty := sorted({p.page_id for p in ps} - {t.page_id for t in every}):
         raise GoldError(f"{len(empty)} pages have no tests, e.g. {empty[:3]}; remove them or give them tests")
-    return pages, tests
+    return ps, every
 
 
 def read(path: str | Path) -> tuple[Test, ...]:
@@ -147,15 +194,24 @@ def page(r: Mapping[str, Any]) -> Page:
     where = f"page {r.get('page_id')!r}"
     if missing := [f for f in PAGE_FIELDS if f not in r]:
         raise GoldError(f"{where} lacks {missing}")
-    if unknown := [f for f in r if f not in PAGE_FIELDS]:
-        raise GoldError(f"{where}: unknown columns {unknown}; a manifest row has {list(PAGE_FIELDS)}")
+    if unknown := [f for f in r if f not in (*PAGE_FIELDS, *OPTIONAL_PAGE_FIELDS)]:
+        raise GoldError(f"{where}: unknown columns {unknown}; a manifest row has "
+                        f"{list(PAGE_FIELDS + OPTIONAL_PAGE_FIELDS)}. If the dataset is newer than this "
+                        f"omni-parse-bench, upgrade it: pip install -U omni-parse-bench")
     if not all(isinstance(r[f], str) and r[f].strip() for f in PAGE_FIELDS):
         raise GoldError(f"{where}: {list(PAGE_FIELDS)} must be non-empty strings")
     if not ((m := _DOC_PATH.fullmatch(r["doc_path"])) and m[1] == r["page_id"]):
         raise GoldError(f"{where}: doc_path must be pages/<page_id>.pdf or .png, not {r['doc_path']!r}")
     if r["gt_path"] != f"gold/{r['page_id']}.json":
         raise GoldError(f"{where}: gt_path must be gold/<page_id>.json, not {r['gt_path']!r}")
-    return Page(r["page_id"], r["document"], r["suite"], r["doc_path"], r["gt_path"])
+    outputs = r.get("outputs")
+    if outputs is not None:
+        if (isinstance(outputs, str) or not outputs or not set(outputs) <= OUTPUTS
+                or len(set(outputs)) != len(outputs)):
+            raise GoldError(f"{where}: outputs must be a non-empty list of distinct output types from "
+                            f"{sorted(OUTPUTS)}, not {outputs!r}")
+        outputs = tuple(sorted(outputs))
+    return Page(r["page_id"], r["document"], r["suite"], r["doc_path"], r["gt_path"], outputs)
 
 
 def test(page_id: str, t: Mapping[str, Any]) -> Test:

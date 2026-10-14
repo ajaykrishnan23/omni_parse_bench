@@ -13,17 +13,16 @@ no vendor call. Each page is asked for exactly the outputs its tests read.
 
 A run directory holds:
 
-    settings.json                what the run is: provider, settings, dataset, gold and timeout
-    records/<page_id>.json       what `predict` returned: outputs, errors, calls, raw responses, and
-                                 a digest of the page file
+    settings.json                what the run asks: provider, settings, dataset (and commit), timeout
+    records/<page_id>.json       what `predict` returned: outputs, errors, calls, raw responses
     predictions/<page_id>.json   the outputs alone, which scoring reads
     scores.jsonl                 one line per test: its verdict, what the test is (page, suite,
                                  document, type, tags, ...), and the stamps of what graded it
     summary.json                 metric.summarize over every graded page, plus cost and coverage
 
-Resumable: a page is predicted again only for the outputs its record lacks (or all of them when its
-page file has changed), and graded again only when its lines are missing or out of date: its
-record, gold or scorer version differs. A run never mixes datasets. Concurrency is per adapter, not per run:
+Resumable: a page is predicted again only for the outputs its record lacks, and graded again only
+when its lines are missing or its record changed. A run never mixes datasets, golds or scorers: one
+graded with another gold or scorer is refused unless --rescore. Concurrency is per adapter, not per run:
 every run of one adapter (two datalab modes, every OpenRouter model) shares one pool of `workers_for`
 its adapter. Credentials come from the environment and everything else from `--options`.
 
@@ -41,7 +40,7 @@ import logging
 import os
 import threading
 import time
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from pathlib import Path
 from typing import Any, NamedTuple
 
@@ -64,8 +63,8 @@ SCORING = ("gold.py", "vocab.py", "runners.py", "views.py", "normalize.py", "tab
 
 
 def scorer_version() -> str:
-    """The package's version and a digest of its scoring code, stamped on each score line so a new
-    scorer regrades.
+    """The package's version and a digest of its scoring code, stamped on each score line so a run
+    graded by another scorer is known (and refused without --rescore).
 
     Note: the version alone is the same across every commit between releases, so it can't say the
     scoring changed; the digest of the files that decide a verdict can.
@@ -89,7 +88,7 @@ class Run(NamedTuple):
     machine, another scheduler) keeps a run exactly as `predict_all` does:
 
         prepare(run, dataset, timeout)                # once: the folder, and settings.json
-        need = needs(run, page_id, want)              # the outputs the page's record still lacks
+        need = needs(run, page)                       # the outputs the page's record still lacks
         record(run, page_id, harness.predict(...))    # the page's new result, merged and written
         grade(run, dataset)                           # scores.jsonl and summary.json, as they stand
 
@@ -110,16 +109,20 @@ class Run(NamedTuple):
 
 
 def prepare(run: Run, dataset: str, timeout: float) -> None:
-    """The run's folder made, and what the run is written to its settings.json (`settle`): provider,
-    settings, dataset, the gold revision it is read against and the timeout per call."""
+    """The run's folder made, and what the run asks written to its settings.json, beside what it already
+    says: provider, settings, dataset (and the commit of a Hugging Face one) and the timeout per call.
+    What graded it is stamped on its score lines and in summary.json."""
     from omni_parse_bench import harness
 
-    root, _, _ = load(dataset)
+    root, _ = manifest(dataset)
     run.records.mkdir(parents=True, exist_ok=True)
     run.predictions.mkdir(exist_ok=True)
-    settle(run, run=run.out.name, provider=run.provider,
-           settings=harness.settings_for(run.provider, run.options), dataset=dataset_id(dataset),
-           gold=gold_revision(dataset, root), timeout_s=timeout)
+    commit = {"commit": root.name} if str(dataset).startswith(HF_PREFIX) else {}
+    path = run.out / "settings.json"
+    write_json(path, (read_json(path) or {}) | {
+        "run": run.out.name, "provider": run.provider,
+        "settings": harness.settings_for(run.provider, run.options), "dataset": dataset_id(dataset),
+        **commit, "timeout_s": timeout})
 
 
 def recorded(run: Run, page_id: str) -> dict | None:
@@ -127,16 +130,17 @@ def recorded(run: Run, page_id: str) -> dict | None:
     return None if (got := read_record(run.records / f"{page_id}.json")) is None else got[0]
 
 
-def needs(run: Run, page_id: str, want: frozenset[str], retry_failed: bool = False) -> frozenset[str]:
-    """The outputs in `want` (what the page's tests read, `gold.wants`) the run still lacks for the
-    page: `missing` over its record."""
-    return missing(recorded(run, page_id), want, retry_failed)
+def needs(run: Run, page: gold.Page, retry_failed: bool = False) -> frozenset[str]:
+    """The outputs the run still lacks for the page: of those the manifest says to predict for it
+    (`page.outputs`), what its record doesn't settle (`missing`)."""
+    assert page.outputs is not None, "pages come from manifest(), which fills outputs in"
+    return missing(recorded(run, page.page_id), frozenset(page.outputs), retry_failed)
 
 
 def record(run: Run, page_id: str, new: dict) -> dict:
-    """A new record of the page made part of the run, and returned: merged into the old one when both
-    are of the same page file (`merged`), else in its place; its outputs written to predictions/, then
-    the record itself."""
+    """A new record of the page made part of the run, and returned: merged into the old one if any
+    (`merged`: the outputs asked again take the new outcome, every call is kept), its outputs written to
+    predictions/, then the record itself."""
     old = recorded(run, page_id)
     kept = merged(old, new) if old is not None else new
     write_json(run.predictions / f"{page_id}.json", kept["outputs"])
@@ -149,7 +153,7 @@ class Plan(NamedTuple):
     pages: tuple[gold.Page, ...]
     dataset: str
     timeout: float
-    workers: int          # calls in flight per adapter; 0: `WORKERS`
+    workers: int | Mapping[str, int]   # calls in flight: one number for every adapter, or per adapter
     rescore: bool
     score_only: bool
     retry_failed: bool = False
@@ -202,21 +206,47 @@ def dataset_id(dataset: str | Path) -> str:
     return str(Path(dataset).expanduser().resolve())
 
 
-def gold_revision(dataset: str, root: Path) -> str:
-    """Which gold a run is graded against: the Hugging Face commit, or a digest of a folder's gold."""
-    if str(dataset).startswith(HF_PREFIX): return root.name   # snapshot_download's folder is the commit
-    # Note: the manifest is in it too: its documents decide the document counts.
-    h = hashlib.sha256((root / gold.MANIFEST).read_bytes())
-    for f in sorted((root / "gold").glob("*.json")):
-        h.update(f.name.encode())
-        h.update(f.read_bytes())
+@functools.cache
+def gold_revision(dataset: str) -> str:
+    """Which gold a run is graded against: a digest of what grading reads, each page's id, document and
+    suite (they decide the counts) and its gold file. So a dataset commit that changes nothing graded (a
+    card, a results table, the derived `outputs` column) is the same gold."""
+    root, ps = manifest(dataset)
+    h = hashlib.sha256()
+    for p in sorted(ps, key=lambda p: p.page_id):
+        h.update(json.dumps([p.page_id, p.document, p.suite]).encode())
+        h.update((root / p.gt_path).read_bytes())
     return h.hexdigest()[:16]
+
+
+def graded_with(scores: dict[str, list[dict]]) -> frozenset[tuple[str | None, str | None]]:
+    """The (gold, scorer) pairs a run's score lines (`read_scores`) were graded with; none before its
+    first grading."""
+    return frozenset((x.get("gold"), x.get("scorer")) for xs in scores.values() for x in xs)
+
+
+def refuse_regrading(run: Run, revision: str, scores: dict[str, list[dict]]) -> None:
+    """Refuses a run whose score lines were graded with another gold or scorer than this one: grading
+    it again would change its scores, which only `--rescore` does, every page at once, never a mix."""
+    if stale := sorted(graded_with(scores) - {(revision, SCORER)}, key=str):
+        was = ", ".join(f"gold {g} with scorer {s}" for g, s in stale)
+        raise ValueError(f"{run.out} was graded against {was}; this is gold {revision} with scorer "
+                         f"{SCORER}. Pass --rescore to grade every page again with these (no page is "
+                         "predicted again), or use the opb and dataset it was graded with")
+
+
+@functools.cache
+def manifest(dataset: str) -> tuple[Path, tuple[gold.Page, ...]]:
+    """The dataset's folder and its pages, each with what to predict for it, read once per process: from
+    the manifest alone when it says (`gold.pages`), so planning and predicting read no gold file."""
+    root = dataset_root(dataset)
+    return root, gold.pages(root)
 
 
 @functools.cache
 def load(dataset: str) -> tuple[Path, tuple[gold.Page, ...], dict[str, tuple[gold.Test, ...]]]:
     """The dataset's folder, its pages, and each page's tests by page id; read once per process."""
-    root = dataset_root(dataset)
+    root, _ = manifest(dataset)
     ps, ts = gold.load(root)
     return root, ps, gold.by_page(ts)
 
@@ -235,13 +265,13 @@ def page_file(dataset: str, root: Path, doc_path: str) -> Path:
 
 
 def pages(dataset: str, suites: list[str] | None = None, limit: int = 0,
-          sample: int = 0, only: frozenset[str] | None = None) -> tuple[Path, tuple[gold.Page, ...]]:
-    """The dataset's folder and its pages, in manifest order, filtered by suite and by `only` (page
-    ids, each of which must be in the dataset), and limited.
+          sample: int = 0, only: frozenset[str] | None = None) -> tuple[gold.Page, ...]:
+    """The dataset's pages, in manifest order, filtered by suite and by `only` (page ids, each of which
+    must be in the dataset), and limited.
 
     `sample` picks that many pages spread over every suite: suites in turn, each page evenly spaced
     within its suite, so a smoke test sees every kind of page and the same pages each time."""
-    root, rows, _ = load(str(dataset))
+    _, rows = manifest(str(dataset))
     known = {r.suite for r in rows}
     if bad := sorted(set(suites or ()) - known):
         raise ValueError(f"unknown suites {bad}; the dataset's suites are {sorted(known)}")
@@ -259,7 +289,7 @@ def pages(dataset: str, suites: list[str] | None = None, limit: int = 0,
         turns = [x for i in range(k) for xs in spread if i < len(xs) for x in [xs[i]]]
         chosen = {r.page_id for r in turns[:sample]}
         rows = tuple(r for r in rows if r.page_id in chosen)
-    return root, rows[:limit] if limit else rows
+    return rows[:limit] if limit else rows
 
 
 def configurations(providers: list[str], options: dict | None = None) -> list[tuple[str, dict]]:
@@ -283,115 +313,79 @@ def plan(providers: list[str], *, out: str | Path = Path("runs"), dataset: str =
          score_only: bool = False, retry_failed: bool = False, only: frozenset[str] | None = None) -> Plan:
     """Every run this invocation makes, checked before any call: a bad option or provider fails here.
 
-    `workers` is the calls in flight per adapter, shared by its runs; 0 takes `WORKERS`."""
+    `workers` is the calls in flight per adapter, shared by its runs: one number for every adapter, or
+    a number per adapter (`per_adapter`); 0, or an adapter left out, takes `WORKERS`."""
     from omni_parse_bench import harness
 
-    for name, n in (("--limit", limit), ("--sample", sample), ("--workers", workers)):
+    counts = [("--limit", limit), ("--sample", sample)]
+    if isinstance(workers, int): counts.append(("--workers", workers))
+    for name, n in counts:
         if n < 0: raise ValueError(f"{name} is {n}, but it counts, so it can't be negative; 0 means no limit")
+    if isinstance(workers, Mapping): workers = per_adapter(workers)
     runs = tuple(Run(p, o, Path(out) / harness.out_name(p, o)) for p, o in configurations(providers, options))
     if twice := [r for r, n in collections.Counter(r.out.name for r in runs).items() if n > 1]:
         raise ValueError(f"run {twice[0]} is asked for more than once: the same provider with the same "
                          "settings (an option set to its default is the same setting); drop the repeat from "
                          "--providers or --options")
-    _, ps = pages(dataset, suites, limit, sample, only)
+    ps = pages(dataset, suites, limit, sample, only)
     ident = dataset_id(dataset)
     for r in runs:
         if (was := (read_json(r.out / "settings.json") or {}).get("dataset", ident)) != ident:
             raise ValueError(f"{r.out} is a run on dataset {was}, not {ident}, and a run never mixes "
                              f"datasets; pass another --out, or --dataset {was}")
+    # Note: refused here, before any call, not after hours of predictions; grade checks again.
+    if not rescore and any((r.out / "scores.jsonl").exists() for r in runs):
+        for r in runs: refuse_regrading(r, gold_revision(str(dataset)), read_scores(r.out / "scores.jsonl"))
     return Plan(runs, ps, str(dataset), timeout or harness.DEFAULT_TIMEOUT, workers, rescore, score_only,
                 retry_failed)
 
 
-def workers_for(adapter: str, requested: int = 0) -> int:
-    """Calls in flight at once for every run of this adapter (`registry.resolve`) together."""
+def workers_for(adapter: str, requested: int | Mapping[str, int] = 0) -> int:
+    """Calls in flight at once for every run of this adapter (`registry.resolve`) together: what was
+    requested (one number for every adapter, or a number per adapter), else `WORKERS`."""
+    if isinstance(requested, Mapping): requested = requested.get(adapter, 0)
     return requested or WORKERS.get(adapter, DEFAULT_WORKERS)
 
 
-PLAN_WIDTH = 110
+def per_adapter(workers: Mapping[str, int]) -> dict[str, int]:
+    """`--workers` as a number per adapter, checked. The limit is a vendor account's, shared by every
+    run of its adapter (every OpenRouter model id shares llm's), so it is set per adapter, never per
+    provider or model."""
+    from omni_parse_bench.harness import registry
+
+    adapters = {m.__name__.rsplit(".", 1)[-1] for m in registry.ADAPTERS.values()} | {"llm"}
+    for key, n in workers.items():
+        if key not in adapters:
+            try:
+                a = registry.resolve(key)
+                hint = f"{key} uses the {a} adapter, whose pool all its runs share; write {{\"{a}\": {n}}}"
+            except ValueError:
+                hint = f"the adapters are {sorted(adapters)}"
+            raise ValueError(f"--workers is per adapter, and {key!r} isn't one: {hint}")
+        if isinstance(n, bool) or not isinstance(n, int) or n < 1:
+            raise ValueError(f"--workers gives {key!r} {n!r}; calls at once is a whole number, 1 or more")
+    return dict(workers)
 
 
-def facts(p: Plan):
-    """What this invocation is, one labelled row each."""
-    from rich.table import Table
-    from rich.text import Text
-
-    from omni_parse_bench import harness
-
-    table = Table(box=None, show_header=False, pad_edge=False)
-    table.add_column("", style="dim", no_wrap=True)
-    table.add_column("", overflow="fold")
-    table.add_row("out", str(p.runs[0].out.parent) if p.runs else "")
-    table.add_row("runs", str(len(p.runs)))
-    table.add_row("dataset", p.dataset)
-    table.add_row("pages", str(len(p.pages)))
-    table.add_row("timeout", f"{p.timeout:.0f}s per call")
-    adapters = sorted({harness.resolve(r.provider) for r in p.runs})
-    table.add_row("at once", ", ".join(f"{a} {workers_for(a, p.workers)}" for a in adapters)
-                  + " calls, shared by an adapter's runs")
-    # Note: shown even when false: `score only  false` is what says this will spend money.
-    for name, on in (("score only", p.score_only), ("rescoring", p.rescore)):
-        table.add_row(name, Text(str(on).lower(), style="bold" if on else "dim"))
-    return table
-
-
-def owed(p: Plan, r: Run, revision: str) -> tuple[int, int]:
+def owed(p: Plan, r: Run) -> tuple[int, int]:
     """How many of the plan's pages this run will predict, and grade, by the rules `predict_all` and
     `grade_all` follow."""
     _, _, tests = load(p.dataset)
     rows = {} if p.rescore else read_scores(r.out / "scores.jsonl")
     predict = grade = 0
     for g in p.pages:
+        coming = not p.score_only and bool(needs(r, g, p.retry_failed))
         got = read_record(r.records / f"{g.page_id}.json")
-        record, text = got if got is not None else (None, "")
-        coming = not p.score_only and bool(missing(record, gold.wants(tests[g.page_id]), p.retry_failed))
         predict += coming
-        grade += coming or (record is not None and not current(rows.get(g.page_id), text, revision,
-                                                                 tests[g.page_id]))
+        grade += coming or (got is not None and not current(rows.get(g.page_id), got[1], tests[g.page_id]))
     return predict, grade
 
 
-def plan_view(p: Plan):
-    """The whole plan as one renderable: each run, its settings, and what it still owes."""
-    from rich import box
-    from rich.console import Group
-    from rich.rule import Rule
-    from rich.table import Table
-    from rich.text import Text
-
-    from omni_parse_bench import harness
-
-    root, _, _ = load(p.dataset)
-    revision = gold_revision(p.dataset, root)
-
-    table = Table(box=box.ROUNDED, header_style="dim", expand=False)
-    table.add_column("adapter", overflow="fold")
-    table.add_column("run", overflow="fold")
-    table.add_column("settings", overflow="fold")
-    table.add_column("predict", justify="right", no_wrap=True)
-    table.add_column("grade", justify="right", no_wrap=True)
-    for r in p.runs:
-        to_predict, to_grade = owed(p, r, revision)
-        settings = [f"{k}={v}" for k, v in harness.settings_for(r.provider, r.options).items()]
-        cell: list = []
-        for n, x in enumerate(settings):
-            if n: cell.append(Rule(style="dim"))
-            cell.append(Text(x, style="cyan"))
-        table.add_row(Text(harness.resolve(r.provider), style="bold"), Text(r.out.name), Group(*cell),
-                      Text(str(to_predict), style="bold" if to_predict else ""),
-                      Text(str(to_grade), style="bold" if to_grade else ""), end_section=True)
-    return Group(Text("benchmark", style="bold"), facts(p), Text(""), table)
-
-
 def describe(p: Plan) -> str:
-    """`plan_view` as plain text, for a log that has no colour and no width to ask about."""
-    import io
+    """What `execute(p)` would do, as plain text (`progress.plan_view`), with no vendor call."""
+    from omni_parse_bench import progress
 
-    from rich.console import Console
-
-    console = Console(file=io.StringIO(), width=PLAN_WIDTH, no_color=True, highlight=False)
-    console.print(plan_view(p))
-    return "\n".join(line.rstrip() for line in console.file.getvalue().splitlines())
+    return progress.describe(p)
 
 
 def write_json(path: Path, obj: Any) -> None:
@@ -452,23 +446,13 @@ def read_scores(path: Path) -> dict[str, list[dict]]:
     return dict(out)
 
 
-def settle(r: Run, **facts: Any) -> None:
-    """`facts` written into the run's settings.json, beside what it already says."""
-    path = r.out / "settings.json"
-    was = read_json(path) or {}
-    now = was | facts
-    if (g := facts.get("gold")) and was.get("gold") not in (None, g):
-        # Note: a gold change regrades the run; the golds it has been read against are kept in order.
-        now["golds"] = [*was.get("golds", [was["gold"]]), g]
-    write_json(path, now)
-
 
 def predict_all(p: Plan) -> None:
     """Predict what each run's records lack. Every run of one adapter drains through that adapter's
     one pool (`workers_for`), the adapters go at once, and a live table shows each run (`progress.py`)."""
     from omni_parse_bench import harness, progress
 
-    root, _, tests = load(p.dataset)
+    root, _ = manifest(p.dataset)
     # Note: set on an interrupt, so no run starts another page; a call already made is let finish.
     stop = threading.Event()
     by: dict[str, list[Run]] = {}
@@ -478,7 +462,7 @@ def predict_all(p: Plan) -> None:
 
     def one(r: Run, g: gold.Page, bar: progress.Reporter, halt: threading.Event) -> None:
         if stop.is_set() or halt.is_set(): return
-        if not (asked := needs(r, g.page_id, gold.wants(tests[g.page_id]), p.retry_failed)):
+        if not (asked := needs(r, g, p.retry_failed)):
             bar.kept()
             return
         try:
@@ -557,15 +541,10 @@ def retryable(record: dict, output: str) -> bool:
 
     calls = [c for c in record.get("calls", []) if output in c.get("outputs", ())]
     if not calls: return False
-    if isinstance(failure := calls[-1].get("failure"), dict):
-        status = failure.get("status")
-        return (failure.get("class") in ("VendorTimeout", "VendorUnreachable") or status is None
-                or status in errors.TRANSIENT_STATUSES)
-    # Note: a call without a failure got an answer, or is from before calls recorded their failure;
-    # then only its error's class, which starts the error's text, is read, and only a timeout or an
-    # outage is tried again.
-    why = str(record.get("errors", {}).get(output, ""))
-    return why.startswith(("VendorTimeout:", "VendorUnreachable:"))
+    if not isinstance(failure := calls[-1].get("failure"), dict): return False   # it got an answer
+    status = failure.get("status")
+    return (failure.get("class") in ("VendorTimeout", "VendorUnreachable") or status is None
+            or status in errors.TRANSIENT_STATUSES)
 
 
 def merged(old: dict, new: dict) -> dict:
@@ -584,13 +563,12 @@ def digest(text: str) -> str:
     return hashlib.sha256(text.encode()).hexdigest()[:16]
 
 
-def current(lines: Sequence[dict] | None, record: str, revision: str, tests: Sequence[gold.Test]) -> bool:
-    """Whether a page's score lines still stand: they grade the record whose digest is `record`, against
-    this gold and with this scorer, one line for each of the page's tests (a renamed test is graded
-    again)."""
+def current(lines: Sequence[dict] | None, record: str, tests: Sequence[gold.Test]) -> bool:
+    """Whether a page's score lines still stand: they grade the record whose digest is `record`, one
+    line for each of the page's tests (a line lost is graded again). Their gold and scorer are the
+    run's, which `refuse_regrading` makes sure of before any page is graded."""
     if not lines: return False
-    return (all(x.get("record") == record and x.get("gold") == revision and x.get("scorer") == SCORER
-                for x in lines)
+    return (all(x.get("record") == record for x in lines)
             and sorted(x["test_id"] for x in lines) == sorted(t.id for t in tests))
 
 
@@ -629,17 +607,19 @@ def grade(run: Run, dataset: str, rescore: bool = False, say: Callable[[str], No
     Grading covers every page of the dataset the run has a record for, whatever `--suites` and
     `--limit` chose to predict, so a smaller invocation never shrinks a run's scores; a page with no
     record is pending, not failed. A page's lines are graded again when they aren't `current`: its
-    record, the gold (`gold_revision`) or the scorer has changed. Scores are written however grading
-    ends, so an interrupt keeps what was graded. A run that was never prepared is refused: its folder
+    record or the page's tests have changed. A run graded with another gold or scorer is refused
+    (`refuse_regrading`) unless `rescore`, which grades every page again; each line and summary.json
+    say which gold and scorer graded them. Scores are written however grading ends, so an
+    interrupt keeps what was graded. A run that was never prepared is refused: its folder
     is most likely another one (another option, another --out)."""
     if not run.records.is_dir():
         raise ValueError(f"no run at {run.out}: {run.provider} with settings {run.options or 'by default'} "
                          "was never prepared there. Check --out and --options, or prepare it first")
     root, every, tests = load(dataset)
-    revision = gold_revision(dataset, root)
-    settle(run, gold=revision)
+    revision = gold_revision(dataset)
     path = run.out / "scores.jsonl"
     old = {} if rescore else read_scores(path)
+    refuse_regrading(run, revision, old)
     lines_of, seen, calls = {}, set(), []
     try:
         for g in every:
@@ -647,7 +627,7 @@ def grade(run: Run, dataset: str, rescore: bool = False, say: Callable[[str], No
                 rec, text = got
                 calls += rec["calls"]
                 had, ts = old.get(g.page_id), tests[g.page_id]
-                lines_of[g.page_id] = had if current(had, text, revision, ts) else grade_page(
+                lines_of[g.page_id] = had if current(had, text, ts) else grade_page(
                     run, rec, text, g, ts, revision)
             seen.add(g.page_id)
     finally:

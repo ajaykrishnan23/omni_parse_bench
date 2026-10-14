@@ -2,6 +2,7 @@
 and grades again, a run's dataset, and the CLI's exit codes."""
 from __future__ import annotations
 
+import argparse
 import ast
 import dataclasses
 import json
@@ -18,7 +19,7 @@ pytest.importorskip("openai")
 
 import httpx  # noqa: E402
 
-from omni_parse_bench import benchmark, cli, harness  # noqa: E402
+from omni_parse_bench import benchmark, cli, gold, harness  # noqa: E402
 from omni_parse_bench.harness import budget, contract, errors, page, registry  # noqa: E402
 from omni_parse_bench.harness.providers import azure, extend, reducto  # noqa: E402
 
@@ -57,8 +58,10 @@ def use(monkeypatch, modules: dict[str, types.ModuleType]) -> None:
     for m in (page, registry): monkeypatch.setattr(m, "adapter", lambda provider: modules[provider])
 
 
-def dataset(root: pathlib.Path, n: int = 1, blocks: bool = False) -> str:
-    """A dataset of `n` pages, each with an html test passing on "alpha" (and a blocks test)."""
+def dataset(root: pathlib.Path, n: int = 1, blocks: bool = False, outputs: list | None = None,
+            extra: dict | None = None) -> str:
+    """A dataset of `n` pages, each with an html test passing on "alpha" (and a blocks test); with
+    `outputs`, the manifest says what to predict for each page, and `extra` adds columns."""
     import pyarrow as pa
     import pyarrow.parquet as pq
 
@@ -77,7 +80,8 @@ def dataset(root: pathlib.Path, n: int = 1, blocks: bool = False) -> str:
                        "settings": {"kind": "text"}})
         (root / "gold" / f"{pid}.json").write_text(json.dumps({"tests": ts}))
         rows.append({"page_id": pid, "document": "a", "suite": "a", "doc_path": f"pages/{pid}.pdf",
-                     "gt_path": f"gold/{pid}.json"})
+                     "gt_path": f"gold/{pid}.json"} | ({"outputs": outputs} if outputs is not None else {})
+                    | (extra or {}))
     pq.write_table(pa.Table.from_pylist(rows), root / "manifest.parquet")
     return str(root)
 
@@ -107,6 +111,23 @@ def test_runs_of_one_adapter_share_its_cap(tmp_path, monkeypatch):
     assert peak[0] <= 2, f"two runs of one adapter had {peak[0]} calls out at once, over its cap of 2"
     assert benchmark.workers_for("datalab") == benchmark.WORKERS["datalab"]
     assert benchmark.workers_for("datalab", 3) == 3 and benchmark.workers_for("unknown") == 5
+
+
+def test_workers_may_be_set_per_adapter(tmp_path, monkeypatch):
+    """Per adapter, the vendor account the limit is: a model id is refused, naming its adapter."""
+    assert benchmark.per_adapter({"datalab": 20, "llm": 3}) == {"datalab": 20, "llm": 3}
+    assert benchmark.workers_for("reducto", {"datalab": 20}) == benchmark.WORKERS["reducto"]
+    for bad, why in [({"nope": 2}, "the adapters are"), ({"openai/gpt-5.6-sol": 3}, 'write {"llm": 3}'),
+                     ({"datalab": 0}, "1 or more"), ({"datalab": True}, "1 or more")]:
+        with pytest.raises(ValueError, match=why):
+            benchmark.per_adapter(bad)
+    assert cli.read_workers("8") == 8 and cli.read_workers('{"datalab": 20}') == {"datalab": 20}
+    with pytest.raises(argparse.ArgumentTypeError):
+        cli.read_workers("abc")
+    use(monkeypatch, {"shared": stub("shared")})
+    p = benchmark.plan(["shared"], out=tmp_path / "runs", dataset=dataset(tmp_path / "data"),
+                       workers={"tesseract": 7})
+    assert p.workers == {"tesseract": 7} and benchmark.workers_for("tesseract", p.workers) == 7
 
 
 # 2. An account failure stops its adapter's runs, and only those.
@@ -146,8 +167,7 @@ def test_an_account_failure_stops_every_run_of_its_adapter_only(tmp_path, monkey
     ({"class": "VendorError", "status": None}, "VendorError: polling failed", True),
     ({"class": "VendorTimeout", "status": None}, "VendorTimeout: timed out", True),
     ({"class": "VendorUnreachable", "status": None}, "VendorUnreachable: reset", True),
-    (None, "VendorTimeout: timed out", True),       # a record from before failures were kept
-    (None, "VendorError: HTTP 503", False),          # read conservatively: only the class
+    (None, "VendorTimeout: timed out", False),      # a call without a failure got an answer
     (None, "the adapter couldn't read the answer: KeyError", False),
 ])
 def test_retry_failed_asks_again_only_what_may_go_otherwise(failure, error, again):
@@ -162,20 +182,22 @@ def test_retry_failed_asks_again_only_what_may_go_otherwise(failure, error, agai
 
 def test_a_loop_of_ones_own_keeps_a_run_through_its_functions(tmp_path, monkeypatch):
     """prepare, needs, record and recorded: predict_all's bookkeeping, for a loop that predicts elsewhere."""
-    monkeypatch.setattr(benchmark, "load", lambda d: (tmp_path / "gold-1", (), {}))
-    monkeypatch.setattr(benchmark, "gold_revision", lambda d, root: root.name)
+    monkeypatch.setattr(benchmark, "manifest", lambda d: (tmp_path / "gold-1", ()))
     r = benchmark.Run("tesseract", {}, tmp_path / "run")
     benchmark.prepare(r, "some/dataset", 900.0)
-    assert json.loads((r.out / "settings.json").read_text())["gold"] == "gold-1"
-    want = frozenset({"html", "blocks"})
-    assert benchmark.needs(r, "p1", want) == want
-    call = {"outputs": ["html", "blocks"], "usd": 0, "wall_s": 1.0}
+    settings = json.loads((r.out / "settings.json").read_text())
+    assert settings["timeout_s"] == 900.0 and "gold" not in settings, "grade writes the gold it graded with"
+    page = gold.Page("p1", "d1", "suite", "pages/p1.pdf", "gold/p1.json", ("blocks", "html"))
+    want = frozenset(page.outputs)
+    assert benchmark.needs(r, page) == want
+    call = {"outputs": ["html", "blocks"], "usd": 0, "wall_s": 1.0,
+            "failure": {"class": "VendorTimeout", "status": None, "transient": True}}
     first = {"outputs": {"html": "<p>a</p>", "blocks": None}, "calls": [call], "raw": [],
              "errors": {"blocks": "VendorTimeout: timed out"}}
     benchmark.record(r, "p1", first)
     assert json.loads((r.predictions / "p1.json").read_text()) == {"html": "<p>a</p>", "blocks": None}
-    assert benchmark.needs(r, "p1", want) == frozenset()
-    assert benchmark.needs(r, "p1", want, retry_failed=True) == frozenset({"blocks"})
+    assert benchmark.needs(r, page) == frozenset()
+    assert benchmark.needs(r, page, retry_failed=True) == frozenset({"blocks"})
     again = {"outputs": {"blocks": []}, "errors": {}, "calls": [call], "raw": []}
     kept = benchmark.record(r, "p1", again)
     assert kept["outputs"] == {"html": "<p>a</p>", "blocks": []} and kept["errors"] == {}
@@ -212,15 +234,32 @@ def test_a_run_folder_holds_one_dataset_and_records_its_gold(tmp_path, monkeypat
     (run,) = p.runs
     settings = json.loads((run.out / "settings.json").read_text())
     assert settings["dataset"] == benchmark.dataset_id(one) and settings["timeout_s"] == 30
-    assert settings["gold"] == benchmark.gold_revision(one, pathlib.Path(one))
+    (summary,) = [json.loads((run.out / "summary.json").read_text())]
+    assert summary["gold"] == benchmark.gold_revision(one) and summary["scorer"] == benchmark.SCORER
+    assert "gold" not in settings, "settings.json says what the run asks; what graded it is on its lines"
     with pytest.raises(ValueError, match="never mixes datasets"):
         benchmark.plan(["stub"], out=tmp_path / "runs", dataset=two)
     gold = pathlib.Path(one) / "gold" / "a-p0.json"
     gold.write_text(gold.read_text().replace('"alpha"', '"beta"'))
-    benchmark.load.cache_clear()
-    benchmark.execute(p, say=QUIET)
-    settings = json.loads((run.out / "settings.json").read_text())
-    assert len(settings["golds"]) == 2 and settings["golds"][-1] == settings["gold"]
+    for f in (benchmark.load, benchmark.manifest, benchmark.gold_revision): f.cache_clear()
+    with pytest.raises(ValueError, match="--rescore"):
+        benchmark.plan(["stub"], out=tmp_path / "runs", dataset=one)
+    benchmark.execute(benchmark.plan(["stub"], out=tmp_path / "runs", dataset=one, rescore=True), say=QUIET)
+    summary = json.loads((run.out / "summary.json").read_text())
+    assert summary["gold"] == benchmark.gold_revision(one)
+
+
+def test_a_dataset_change_that_grades_nothing_differently_is_the_same_gold(tmp_path):
+    """A card, a results table or the derived outputs column change the commit, not the gold."""
+    a = dataset(tmp_path / "a")
+    b = dataset(tmp_path / "b", outputs=["html"])
+    assert benchmark.gold_revision(a) == benchmark.gold_revision(b)
+    c = dataset(tmp_path / "c")
+    gold = pathlib.Path(c) / "gold" / "a-p0.json"
+    gold.write_text(gold.read_text().replace('"alpha"', '"beta"'))
+    assert benchmark.gold_revision(c) != benchmark.gold_revision(a)
+
+
 
 
 def test_each_call_keeps_the_timeout_it_ran_under(tmp_path, monkeypatch):
@@ -249,6 +288,48 @@ def test_a_page_already_answered_is_not_fetched_again(tmp_path, monkeypatch):
     assert len(calls) == 1 and fetched == []
 
 
+def test_a_manifest_that_says_what_to_predict_is_planned_without_the_gold(tmp_path, monkeypatch):
+    """With outputs in the manifest, planning and predicting read no gold file; grading does."""
+    calls = []
+    use(monkeypatch, {"stub": stub(call=lambda config: calls.append(1) or contract.Call({"html": "alpha"}))})
+    data = dataset(tmp_path / "data", n=2, outputs=["html"])
+    assert [p.outputs for p in gold.pages(data)] == [("html",), ("html",)]
+    read = []
+    real = gold.read
+    monkeypatch.setattr(gold, "read", lambda path: read.append(path) or real(path))
+    p = benchmark.plan(["stub"], out=tmp_path / "runs", dataset=data)
+    benchmark.predict_all(p)
+    assert len(calls) == 2 and read == [], "planning and predicting read no gold"
+    assert benchmark.grade_all(p, say=QUIET)[p.runs[0].out.name]["pages"] == 2 and read
+
+
+def test_a_manifest_without_outputs_reads_them_from_the_gold(tmp_path):
+    """Every older commit of a dataset stays readable: the column is derived from the tests."""
+    data = dataset(tmp_path / "data", blocks=True)
+    (page,) = gold.pages(data)
+    assert page.outputs == ("blocks", "html")
+
+
+def test_outputs_out_of_step_with_the_gold_are_refused(tmp_path):
+    data = dataset(tmp_path / "data", blocks=True, outputs=["html"])
+    with pytest.raises(gold.GoldError, match="out of step with the gold"):
+        gold.load(data)
+
+
+@pytest.mark.parametrize("outputs", [[], ["html", "html"], ["html", "pdf"]])
+def test_outputs_must_be_distinct_known_output_types(tmp_path, outputs):
+    data = dataset(tmp_path / "data", outputs=outputs)
+    with pytest.raises(gold.GoldError, match="distinct output types"):
+        gold.manifest(data)
+
+
+def test_an_unknown_manifest_column_says_to_upgrade(tmp_path):
+    """What an older omni-parse-bench meets in a newer dataset: the fix is in the message."""
+    data = dataset(tmp_path / "data", extra={"weight": "1"})
+    with pytest.raises(gold.GoldError, match="pip install -U omni-parse-bench"):
+        gold.manifest(data)
+
+
 # 5. The plan counts what will be predicted.
 
 def test_the_plan_counts_what_will_be_predicted(tmp_path, monkeypatch):
@@ -257,18 +338,18 @@ def test_the_plan_counts_what_will_be_predicted(tmp_path, monkeypatch):
     data = dataset(tmp_path / "data", blocks=True)
     p = benchmark.plan(["stub"], out=tmp_path / "runs", dataset=data)
     (run,) = p.runs
-    revision = benchmark.gold_revision(data, pathlib.Path(data))
-    assert benchmark.owed(p, run, revision) == (1, 1)
+    assert benchmark.owed(p, run) == (1, 1)
     benchmark.execute(p, say=QUIET)
     assert saved(run)["errors"]["blocks"] == "unsupported"
-    assert benchmark.owed(p, run, revision) == (0, 0), "an unsupported output is settled"
-    assert benchmark.owed(p._replace(retry_failed=True), run, revision) == (1, 1)
+    assert benchmark.owed(p, run) == (0, 0), "an unsupported output is settled"
+    assert benchmark.owed(p._replace(retry_failed=True), run) == (1, 1)
     assert "predict" in benchmark.describe(p)
 
 
 # 6. Score lines carry the gold and scorer that graded them.
 
-def test_rows_are_graded_again_when_the_scorer_changes_without_a_summary(tmp_path, monkeypatch):
+def test_a_run_graded_by_another_scorer_is_refused_unless_rescored(tmp_path, monkeypatch):
+    """A new scorer changes scores, which only --rescore does, every page at once, never a mix."""
     use(monkeypatch, {"stub": stub()})
     p = benchmark.plan(["stub"], out=tmp_path / "runs", dataset=dataset(tmp_path / "data", 2))
     (s,) = benchmark.execute(p, say=QUIET).values()
@@ -276,26 +357,34 @@ def test_rows_are_graded_again_when_the_scorer_changes_without_a_summary(tmp_pat
     rows = [json.loads(x) for x in (run.out / "scores.jsonl").read_text().splitlines()]
     assert {r["scorer"] for r in rows} == {benchmark.SCORER} and s["scorer"] == benchmark.SCORER
     assert {r["gold"] for r in rows} == {s["gold"]}
-    (run.out / "summary.json").unlink()
     monkeypatch.setattr(benchmark, "SCORER", "next")
+    with pytest.raises(ValueError, match="--rescore"):
+        benchmark.plan(["stub"], out=tmp_path / "runs", dataset=p.dataset)
+    with pytest.raises(ValueError, match="--rescore"):
+        benchmark.grade(run, p.dataset)
     graded = []
     real = benchmark.grade_page
     monkeypatch.setattr(benchmark, "grade_page", lambda *a: graded.append(1) or real(*a))
-    benchmark.execute(p._replace(score_only=True), say=QUIET)
+    benchmark.execute(p._replace(score_only=True, rescore=True), say=QUIET)
     assert len(graded) == 2
     rows = [json.loads(x) for x in (run.out / "scores.jsonl").read_text().splitlines()]
     assert {r["scorer"] for r in rows} == {"next"}
 
 
-def test_a_renamed_test_is_graded_again_not_a_crash(tmp_path, monkeypatch):
+
+
+def test_a_renamed_test_is_a_gold_change(tmp_path, monkeypatch):
+    """Renaming a test changes the gold: refused, then graded under its new name with --rescore."""
     use(monkeypatch, {"stub": stub()})
     data = dataset(tmp_path / "data")
     p = benchmark.plan(["stub"], out=tmp_path / "runs", dataset=data)
     benchmark.execute(p, say=QUIET)
     gold = pathlib.Path(data) / "gold" / "a-p0.json"
     gold.write_text(gold.read_text().replace('"t0"', '"t0-renamed"'))
-    benchmark.load.cache_clear()
-    (s,) = benchmark.execute(p._replace(score_only=True), say=QUIET).values()
+    for f in (benchmark.load, benchmark.manifest, benchmark.gold_revision): f.cache_clear()
+    with pytest.raises(ValueError, match="--rescore"):
+        benchmark.execute(p._replace(score_only=True), say=QUIET)
+    (s,) = benchmark.execute(p._replace(score_only=True, rescore=True), say=QUIET).values()
     assert s["html"]["score"] == 1.0
     lines = [json.loads(x) for x in (p.runs[0].out / "scores.jsonl").read_text().splitlines()]
     assert [x["test_id"] for x in lines] == ["t0-renamed"]
@@ -462,7 +551,7 @@ def test_a_bad_count_or_an_empty_options_list_is_refused():
             benchmark.plan(["datalab"], dataset="unused", **kwargs)
     with pytest.raises(ValueError, match="empty list"):
         benchmark.plan(["datalab"], dataset="unused", options={"datalab": []})
-    with pytest.raises(SystemExit, match="negative"):
+    with pytest.raises(ValueError, match="negative"):
         cli.main(["benchmark", "--providers", "datalab", "--limit", "-1", "-y"])
 
 
@@ -506,7 +595,9 @@ def test_an_unreadable_record_is_predicted_again_and_a_bad_score_line_graded_aga
     assert len(scores.read_text().splitlines()) == 2
 
 
-def test_an_interrupted_grading_keeps_what_it_graded(tmp_path, monkeypatch):
+def test_an_interrupted_regrading_never_mixes_scorers(tmp_path, monkeypatch):
+    """An interrupted --rescore keeps the pages it regraded and drops the rest, which the next grading
+    grades with the same scorer, so a run's lines never come from two."""
     use(monkeypatch, {"stub": stub()})
     p = benchmark.plan(["stub"], out=tmp_path / "runs", dataset=dataset(tmp_path / "data", 3))
     benchmark.execute(p, say=QUIET)
@@ -520,10 +611,16 @@ def test_an_interrupted_grading_keeps_what_it_graded(tmp_path, monkeypatch):
 
     monkeypatch.setattr(benchmark, "grade_page", once)
     with pytest.raises(KeyboardInterrupt):
-        benchmark.execute(p._replace(score_only=True), say=QUIET)
+        benchmark.execute(p._replace(score_only=True, rescore=True), say=QUIET)
     rows = [json.loads(x) for x in (p.runs[0].out / "scores.jsonl").read_text().splitlines()]
-    assert [r["page_id"] for r in rows] == ["a-p0", "a-p1", "a-p2"], "a page not yet regraded keeps its row"
-    assert [r["scorer"] == "next" for r in rows] == [True, False, False]
+    assert [(r["page_id"], r["scorer"]) for r in rows] == [("a-p0", "next")]
+    monkeypatch.setattr(benchmark, "grade_page", real)
+    benchmark.execute(p._replace(score_only=True), say=QUIET)
+    rows = [json.loads(x) for x in (p.runs[0].out / "scores.jsonl").read_text().splitlines()]
+    assert [r["page_id"] for r in rows] == ["a-p0", "a-p1", "a-p2"]
+    assert {r["scorer"] for r in rows} == {"next"}
+
+
 
 
 def test_the_scorer_stamp_changes_with_the_scoring_code(tmp_path, monkeypatch):
@@ -571,7 +668,8 @@ def test_a_page_of_several_tests_is_graded_again_whole_and_only_when_stale(tmp_p
     graded = graded_pages(monkeypatch)
     benchmark.execute(p._replace(score_only=True), say=QUIET)
     assert graded == []
-    lines[1]["scorer"] = "old"   # a-p0: one stale line; a-p1: one line lost
+    rec = run.records / "a-p0.json"     # a-p0: its record changed; a-p1: one line lost
+    rec.write_text(json.dumps(json.loads(rec.read_text()), indent=1))
     path.write_text("".join(json.dumps(x) + "\n" for x in lines[:3]))
     benchmark.execute(p._replace(score_only=True), say=QUIET)
     assert graded == ["a-p0", "a-p1"]

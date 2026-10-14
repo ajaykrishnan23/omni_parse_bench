@@ -205,7 +205,8 @@ p = benchmark.plan(
   only=None,              # a set of page ids: run only these
   options=None,           # per provider: {"datalab": {"mode": "accurate"}}, or a list of dicts
   timeout=0,              # seconds per vendor call; 0: the default, 900
-  workers=0,              # calls at once per adapter, shared by its runs; 0: `benchmark.WORKERS`
+  workers=0,              # calls at once per adapter, shared by its runs: one number, or per adapter
+                          # ({"datalab": 20, "llm": 3}); 0, or an adapter left out: `benchmark.WORKERS`
   rescore=False,          # grade every page again
   score_only=False,       # grade what's recorded; call no vendor
   retry_failed=False,     # predict again outputs whose failure may not recur
@@ -243,9 +244,12 @@ Concurrency is per adapter, not per run: every run of one adapter shares one poo
 rate limit is per account. Two datalab modes share datalab's pool, and every OpenRouter model id
 shares the llm adapter's. Each adapter's pool size is in `benchmark.WORKERS` (datalab 10, extend,
 mistral and llm 5, reducto, llamaparse and azure 3, tesseract the CPU count up to 8, others 5);
-`--workers N` sets N for every adapter. When one run hits an account failure or a missing key,
-every run of its adapter stops at once; other adapters go on, the run is graded, and the failure is
-then raised.
+`--workers N` sets N for every adapter; `--workers '{"datalab": 20, "llm": 3}'` sets only the adapters
+named, and the others keep their defaults. Keys are adapters, not providers or models: the limit is
+the vendor account's, so 3 for `llm` is 3 in flight across every OpenRouter model id together. A
+model id as a key is refused, naming its adapter. When one run hits an account failure or a missing
+key, every run of its adapter stops at once; other adapters go on, the run is graded, and the failure
+is then raised.
 
 ### Settings per provider
 
@@ -281,17 +285,21 @@ It's resumable, and safe to run twice.
   and pages are pinned to a dataset commit and never edited in place. To predict again after a
   dataset's pages change, use a new `--out`;
 - a record that isn't readable JSON counts as not predicted, and is logged;
-- a page is graded again when its lines in `scores.jsonl` are missing, unreadable or out of date: its
-  record, the gold or the scorer version differs, or the page's test ids have changed;
+- a page is graded again when its lines in `scores.jsonl` are missing or unreadable, or its record
+  has changed (it was predicted again);
+- a run graded with another gold or scorer is refused, before any call: grading it again would change
+  its scores, so `--rescore` does that, every page at once, never a mix of two. The gold is a digest
+  of what grading reads (each page's id, document and suite, and its gold file), so a dataset commit
+  that changes nothing graded (its card, a results table, the derived `outputs`) is the same gold;
 - grading covers every page the run has a record for, so `--limit` and `--suites` narrow what is
   predicted, never what is scored; and
 - scores are written however grading ends, so an interrupt keeps what was graded.
 
-A run folder holds one dataset: an invocation with another `--dataset` into it is refused. A change
-of gold (a new commit of the same dataset) is allowed, regrades the run and is kept in
-`settings.json`. Pages are fetched at the commit the gold was read at.
+A run folder holds one dataset: an invocation with another `--dataset` into it is refused. Pages are
+fetched at the dataset commit the run reads.
 
-`--rescore` grades every page again. `--score-only` predicts nothing. `--retry-failed` predicts again
+`--rescore` grades every page again, with this opb's scorer against this dataset's gold, and predicts
+nothing again; grading is local and cheap. `--score-only` predicts nothing. `--retry-failed` predicts again
 the outputs whose failure may not recur: a timeout, an outage, a 429 or 5xx (Cloudflare's 520 to 524
 too), or a failure with no HTTP status. A 400, a vendor's failed job, or an LLM reply that was
 truncated, refused or unusable is an answer, and is not retried.
@@ -308,14 +316,14 @@ itself. A `benchmark.Run` is an address, as a `Path` is: what the run holds is w
 holds when it is read.
 
 ```python
-from omni_parse_bench import benchmark, gold, harness
+from omni_parse_bench import benchmark, harness
 
 p = benchmark.plan(["dots-mocr"], out="runs")
 (run,) = p.runs
-root, _, tests = benchmark.load(p.dataset)
+root, _ = benchmark.manifest(p.dataset)
 benchmark.prepare(run, p.dataset, p.timeout)
 for page in p.pages:
-    if need := benchmark.needs(run, page.page_id, gold.wants(tests[page.page_id])):
+    if need := benchmark.needs(run, page):
         file = benchmark.page_file(p.dataset, root, page.doc_path)
         result = harness.predict(run.provider, file, need, timeout=p.timeout, **run.options)  # wherever
         benchmark.record(run, page.page_id, result)
@@ -323,17 +331,17 @@ benchmark.grade(run, p.dataset)
 ```
 
 - `prepare(run, dataset, timeout)` makes the folder and writes `settings.json`;
-- `needs(run, page_id, want, retry_failed=False)` is the outputs to ask `predict` for, and is
-  passed to it as they are. `want` is what the page's tests read (`gold.wants`, usually `{"html",
-  "blocks"}`); `needs` is the part of it the page's record doesn't settle:
+- `needs(run, page, retry_failed=False)` is the outputs to ask `predict` for, and is passed to it as
+  they are. `page` is a manifest row; its `outputs` say what to predict (usually `["html"]` or
+  `["html", "blocks"]`), and `needs` is the part of them the page's record doesn't settle:
 
   | the page's record | `needs` returns |
   | --- | --- |
-  | none yet | all of `want` |
+  | none yet | all of its `outputs` |
   | without an output, never asked (a gold that added layout tests later; one of an LLM's separate calls cut short) | that output |
   | with an output failed in a way that may not recur (a timeout, an outage, a 429 or 5xx), with `retry_failed=True` | that output |
   | with an output recorded as unsupported | nothing for it |
-  | holding all of `want` | nothing, so the page is skipped |
+  | holding all of its `outputs` | nothing, so the page is skipped |
 
   A page has several outputs, often from separate, paid calls, so the answer is a set, not a yes or no:
   a resume, `--retry-failed` or a new kind of test asks for what is missing only. A loop that asks for
@@ -398,7 +406,7 @@ loop over `score` (see [The dataset](#the-dataset)).
 ## The dataset
 
 ```
-manifest.parquet        one row per page: page_id, document, suite, doc_path, gt_path
+manifest.parquet        one row per page: page_id, document, suite, doc_path, gt_path, outputs
 pages/<page_id>.pdf     the page that gets sent (or .png)
 gold/<page_id>.json     its tests: {"tests": [...]}
 ```
@@ -406,7 +414,9 @@ gold/<page_id>.json     its tests: {"tests": [...]}
 The dataset is the source of truth: a correction is an edit to a gold file, and a dropped page is
 removed with its files and its manifest row. The pages' licenses are in `licenses/`.
 
-`gold.load` reads it all, checked (it needs the benchmark extra, for parquet):
+`gold.pages` reads the manifest alone: every page, with what to predict for it (`outputs`).
+`gold.tests(root, page)` reads one page's tests. `gold.load` reads it all, checked (each needs the
+benchmark extra, for parquet):
 
 ```python
 from omni_parse_bench import gold, score, summarize
@@ -415,7 +425,7 @@ pages, tests = gold.load("dataset/")
 pages[0]
 # Page(page_id='olmo_arxiv_math-2502.15977_pg21-p1', document='olmo_arxiv_math:2502.15977',
 #      suite='olmo_arxiv_math', doc_path='pages/olmo_arxiv_math-2502.15977_pg21-p1.pdf',
-#      gt_path='gold/olmo_arxiv_math-2502.15977_pg21-p1.json')
+#      gt_path='gold/olmo_arxiv_math-2502.15977_pg21-p1.json', outputs=('html',))
 tests[0]
 # Test(id='2502.15977_pg21_math_003', page_id='olmo_arxiv_math-2502.15977_pg21-p1', test_type='present',
 #      output_type='html', derivation='upstream_olmocr', tags=('math',),
@@ -428,12 +438,14 @@ Grading your own model is a loop over pages:
 by_page = gold.by_page(tests)
 verdicts = []
 for p in pages:
-    outputs = my_model("dataset/" + p.doc_path, gold.wants(by_page[p.page_id]))
+    outputs = my_model("dataset/" + p.doc_path, p.outputs)
     verdicts += score(outputs, by_page[p.page_id])
 summary = summarize(verdicts, tests, pages)
 ```
 
-`gold.wants` is the set of outputs a page's tests read. `gold.read(path)` reads one gold file.
+`p.outputs` is what to predict for the page: the outputs its tests read (`gold.wants`). A manifest
+from before the column has it read from the gold, and a manifest whose `outputs` disagree with the
+gold is refused. `gold.read(path)` reads one gold file.
 
 ### Exploring the tests
 
@@ -549,18 +561,19 @@ accurate. The digest isn't meant to be read; `settings.json` is.
 
 ### settings.json
 
-What the run is, written before the first page, so an interrupted run still says what it is.
+What the run asks, written before the first page, so an interrupted run still says what it is. What
+graded it is on each score line and in `summary.json`.
 
 ```json
 {"run": "datalab-296b76d9", "provider": "datalab",
  "settings": {"mode": "balanced", "base_url": "https://www.datalab.to", "poll_interval": 2.0},
- "dataset": "hf://datasets/datalab-to/omni_parse_bench", "gold": "857550728dd99df40d2139946d99f711568ed529",
+ "dataset": "hf://datasets/datalab-to/omni_parse_bench", "commit": "175cc91a9df1a8d1ee2339ad652d3dce20852911",
  "timeout_s": 900}
 ```
 
 - `settings` is the whole resolved configuration, not just what you passed;
 - `dataset` is the dataset's repo, or a folder's path: a later invocation with another is refused;
-- `gold` is the gold last graded against, and `golds`, once it has changed, every one in order; and
+  `commit` is the Hugging Face commit the run reads; and
 - `timeout_s` is the latest invocation's; each call in a record keeps its own.
 
 ### summary.json
@@ -571,13 +584,13 @@ and cost:
 ```json
 {"headline": {"...": "..."}, "html": {"...": "..."}, "blocks": {"...": "..."},
  "per_suite": {"...": "..."}, "per_derivation": {"...": "..."},
- "gold": "857550728dd99df40d2139946d99f711568ed529",
+ "gold": "fb8cb369b9538d1a",
  "scorer": "0.1.1+a09ce5ecf32a", "pages": 2937, "pages_pending": 0, "usd": 13.668,
  "credits": 0}
 ```
 
-- `gold` is the gold it was graded against: the Hugging Face commit, or a digest of a folder's
-  manifest and gold files;
+- `gold` is the gold it was graded against: a digest of each page's id, document and suite and its
+  gold file;
 - `scorer` is the package version and a digest of its scoring code, which graded it;
 - `pages` is how many pages were graded, and `pages_pending` how many of the dataset's pages have
   no record yet; and
@@ -604,11 +617,12 @@ One line per test, in manifest order: its verdict, what the test is, and the sta
  "suite": "olmo_arxiv_math", "document": "olmo_arxiv_math:2502.15977",
  "test_id": "2502.15977_pg21_math_003", "test_type": "present", "output_type": "html",
  "derivation": "upstream_olmocr", "tags": ["math"], "result": "pass", "why": "",
- "record": "5f0c...", "gold": "857550728dd99df40d2139946d99f711568ed529", "scorer": "0.1.1+a09ce5ecf32a"}
+ "record": "5f0c...", "gold": "fb8cb369b9538d1a", "scorer": "0.1.1+a09ce5ecf32a"}
 ```
 
 - `run` and `provider` name the run (its folder) and its provider; `settings.json` has the rest;
 - `page_id` to `tags` say what the test is (`opb tests` writes the same, its id as `id`);
 - `result` is `pass`, `fail`, `unsupported` or `error`, and `why` says what went wrong; and
-- `record`, `gold` and `scorer` stamp what was graded and by what: a line whose stamps are out of
-  date is graded again on the next `opb benchmark`.
+- `record`, `gold` and `scorer` stamp what was graded and by what: a line whose record changed is
+  graded again on the next `opb benchmark`, and a run whose lines were graded with another gold or
+  scorer is refused until `--rescore`.

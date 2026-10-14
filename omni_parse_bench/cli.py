@@ -25,7 +25,7 @@ from collections.abc import Sequence
 from pathlib import Path
 from typing import Any
 
-from omni_parse_bench import benchmark
+from omni_parse_bench import benchmark, progress
 
 # command -> the extra it needs; `score` needs none.
 EXTRAS = {"predict": "harness", "providers": "harness", "reparse": "harness", "benchmark": "benchmark",
@@ -36,10 +36,24 @@ EXTRAS = {"predict": "harness", "providers": "harness", "reparse": "harness", "b
 def read_json(path: str) -> Any:
     try:
         return json.loads(Path(path).read_text())
-    except FileNotFoundError:
-        raise SystemExit(f"no file at {path}") from None
     except json.JSONDecodeError as e:
-        raise SystemExit(f"{path} isn't JSON: {e}") from None
+        raise ValueError(f"{path} isn't JSON: {e}") from e
+
+
+def read_workers(value: str) -> int | dict:
+    """`--workers` as one number for every adapter, or a JSON object of a number per adapter."""
+    try:
+        return int(value)
+    except ValueError:
+        pass
+    try:
+        out = json.loads(value)
+    except json.JSONDecodeError:
+        raise argparse.ArgumentTypeError(
+            f"--workers is a number, or a JSON object like '{{\"datalab\": 20}}', not {value!r}") from None
+    if not isinstance(out, dict):
+        raise argparse.ArgumentTypeError(f"--workers must be a number or a JSON object, not {value!r}")
+    return out
 
 
 def read_options(value: str | None) -> dict:
@@ -49,9 +63,9 @@ def read_options(value: str | None) -> dict:
     try:
         out = json.loads(text)
     except json.JSONDecodeError as e:
-        raise SystemExit(f"--options isn't JSON: {e}") from None
+        raise ValueError(f"--options isn't JSON: {e}") from e
     if not isinstance(out, dict):
-        raise SystemExit(f"--options must be a JSON object, got {type(out).__name__}")
+        raise ValueError(f"--options must be a JSON object, got {type(out).__name__}")
     return out
 
 
@@ -59,7 +73,6 @@ def cmd_score(a: argparse.Namespace) -> int:
     """What `score` returns: one verdict per test of the page."""
     from omni_parse_bench import gold, score
 
-    if not Path(a.gold).exists(): raise SystemExit(f"no file at {a.gold}")
     vs = score(read_json(a.pred), gold.read(a.gold), unsupported=set(a.unsupported or ()))
     print(json.dumps([v._asdict() for v in vs], indent=2, ensure_ascii=False))
     return 0
@@ -149,7 +162,7 @@ def confirm_plan(plan: Any) -> bool:
     """
     from rich.console import Console
 
-    Console(stderr=True, highlight=False).print(benchmark.plan_view(plan))
+    Console(stderr=True, highlight=False).print(progress.plan_view(plan))
     if not sys.stdin.isatty():
         return True
     try:
@@ -167,14 +180,11 @@ def cmd_benchmark(a: argparse.Namespace) -> int:
     # huggingface_hub 2 makes its requests through httpx2, whose logger is its own.
     for name in ("httpx", "httpx2", "httpcore", "openai", "huggingface_hub"):
         logging.getLogger(name).setLevel(logging.WARNING)
-    try:
-        p = benchmark.plan(a.providers, out=a.out, dataset=a.dataset, suites=a.suites, limit=a.limit,
-                           sample=a.sample, options=read_options(a.options), timeout=a.timeout,
-                           workers=a.workers, rescore=a.rescore, score_only=a.score_only,
-                           retry_failed=a.retry_failed,
-                           only=frozenset(a.pages.read_text().split()) if a.pages else None)
-    except ValueError as exc:
-        raise SystemExit(f"opb benchmark: {exc}") from None
+    p = benchmark.plan(a.providers, out=a.out, dataset=a.dataset, suites=a.suites, limit=a.limit,
+                       sample=a.sample, options=read_options(a.options), timeout=a.timeout,
+                       workers=a.workers, rescore=a.rescore, score_only=a.score_only,
+                       retry_failed=a.retry_failed,
+                       only=frozenset(a.pages.read_text().split()) if a.pages else None)
     if not a.yes and not a.score_only and not confirm_plan(p):
         return 1
     summaries = benchmark.execute(p, lambda s: print(s, file=sys.stderr))
@@ -246,8 +256,10 @@ def main(argv: Sequence[str] | None = None) -> int:
                    help='per provider: {"datalab": {"mode": "balanced"}}, or a list of such dicts '
                         "for several runs")
     b.add_argument("--timeout", type=float, default=900, help="seconds per vendor call")
-    b.add_argument("--workers", type=int, default=0,
-                   help="calls at once per adapter, shared by its runs (default: a table per vendor)")
+    b.add_argument("--workers", type=read_workers, default=0, metavar="N|JSON",
+                   help="calls at once per adapter, shared by its runs: N for every adapter, or a number "
+                        'per adapter, e.g. \'{"datalab": 20, "llm": 3}\' (llm: every OpenRouter model id; '
+                        "default: a table per vendor)")
     b.add_argument("--rescore", action="store_true", help="grade every page again, after a scorer change")
     b.add_argument("--score-only", action="store_true", help="grade what's recorded; predict nothing")
     b.add_argument("--retry-failed", action="store_true",
@@ -279,9 +291,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         missing = exc.name or (m[1] if (m := re.search(r"No module named '([^']+)'", str(exc))) else None)
         if a.cmd not in EXTRAS or not missing or missing.startswith("omni_parse_bench"): raise
         extra = EXTRAS[a.cmd]
-        print(f"opb {a.cmd} needs {missing.split('.')[0]}, which comes with the {extra} extra:\n"
-              f"    pip install 'omni-parse-bench[{extra}]'", file=sys.stderr)
-        return 1
+        raise ImportError(f"opb {a.cmd} needs {missing.split('.')[0]}, which comes with the {extra} extra: "
+                          f"pip install 'omni-parse-bench[{extra}]'", name=exc.name) from exc
 
 
 if __name__ == "__main__":
