@@ -299,6 +299,37 @@ An output whose answer arrived but didn't parse is fixed for free: after a parsi
 `opb reparse RUN_DIR` reads every record's outputs again from its saved answers, and
 `opb benchmark ... --score-only --rescore` grades them.
 
+### A loop of your own
+
+`opb benchmark` is one loop over pages. To predict elsewhere (on another machine, on a GPU cluster, on
+a scheduler) and still get the same run folder, keep the run with the methods of its `benchmark.Run`,
+the ones `opb benchmark` uses itself:
+
+```python
+from omni_parse_bench import benchmark, gold, harness
+
+p = benchmark.plan(["dots-mocr"], out="runs")
+(run,) = p.runs
+root, _, tests = benchmark.load(p.dataset)
+run.start(p.dataset, benchmark.gold_revision(p.dataset, root), p.timeout)
+for page in p.pages:
+    file = benchmark.page_file(p.dataset, root, page.doc_path)
+    sha = benchmark.file_digest(file)
+    if need := run.owed(page.page_id, gold.wants(tests[page.page_id]), sha):
+        record = harness.predict(run.provider, file, need, timeout=p.timeout, **run.options)
+        run.keep(page.page_id, record | {"page_sha256": sha})  # wherever it ran
+benchmark.grade_all(p)
+```
+
+- `run.start(dataset, gold, timeout)` makes the folder and writes `settings.json`;
+- `run.owed(page_id, want, page_sha, retry_failed=False)` is what the page still lacks, by the rules
+  above (pass `retry_failed=True` for `--retry-failed`);
+- `run.keep(page_id, record)` merges a new record into the old one of the same page file, writes it
+  and its prediction, and returns it; the record carries `page_sha256`; and
+- `run.record(page_id)` reads a page's record.
+
+The folder is then exactly one `opb benchmark` writes, so either can resume or grade it.
+
 
 ## providers
 

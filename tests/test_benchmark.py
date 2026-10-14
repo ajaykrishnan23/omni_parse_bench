@@ -160,6 +160,28 @@ def test_retry_failed_asks_again_only_what_may_go_otherwise(failure, error, agai
 
 # 4. A run's dataset, gold and timeout.
 
+def test_a_loop_of_ones_own_keeps_a_run_through_its_methods(tmp_path):
+    """start, owed and keep: what predict_all does per page, for a loop that predicts elsewhere."""
+    r = benchmark.Run("tesseract", {}, tmp_path / "run")
+    r.start("some/dataset", "gold-1", 900.0)
+    assert json.loads((r.out / "settings.json").read_text())["gold"] == "gold-1"
+    want = frozenset({"html", "blocks"})
+    assert r.owed("p1", want, "sha-a") == want
+    call = {"outputs": ["html", "blocks"], "usd": 0, "wall_s": 1.0}
+    first = {"outputs": {"html": "<p>a</p>", "blocks": None}, "calls": [call], "raw": [],
+             "errors": {"blocks": "VendorTimeout: timed out"}, "page_sha256": "sha-a"}
+    r.keep("p1", first)
+    assert json.loads((r.predictions / "p1.json").read_text()) == {"html": "<p>a</p>", "blocks": None}
+    assert r.owed("p1", want, "sha-a") == frozenset()
+    assert r.owed("p1", want, "sha-a", retry_failed=True) == frozenset({"blocks"})
+    again = {"outputs": {"blocks": []}, "errors": {}, "calls": [call], "raw": [], "page_sha256": "sha-a"}
+    kept = r.keep("p1", again)
+    assert kept["outputs"] == {"html": "<p>a</p>", "blocks": []} and kept["errors"] == {}
+    assert len(kept["calls"]) == 2 and r.record("p1") == kept
+    assert r.owed("p1", want, "sha-b") == want  # another page file: all of it again
+    assert r.keep("p1", first | {"page_sha256": "sha-b"})["calls"] == [call]
+
+
 def test_a_page_is_fetched_at_the_commit_its_gold_was_read_at(tmp_path, monkeypatch):
     import huggingface_hub
 
