@@ -88,7 +88,7 @@ class Run(NamedTuple):
     The functions below are the bookkeeping of any loop over its pages, so a loop of your own (another
     machine, another scheduler) keeps a run exactly as `predict_all` does:
 
-        start(run, dataset, timeout)                  # once: the folder, and settings.json
+        prepare(run, dataset, timeout)                # once: the folder, and settings.json
         need = needs(run, page_id, want, sha)         # the outputs the page's record still lacks
         store(run, page_id, harness.predict(...))     # the page's new record, merged and written
         grade(run, dataset)                           # scores.jsonl and summary.json, as they stand
@@ -109,7 +109,7 @@ class Run(NamedTuple):
         return self.out / "predictions"
 
 
-def start(run: Run, dataset: str, timeout: float) -> None:
+def prepare(run: Run, dataset: str, timeout: float) -> None:
     """The run's folder made, and what the run is written to its settings.json (`settle`): provider,
     settings, dataset, the gold revision it is read against and the timeout per call."""
     from omni_parse_bench import harness
@@ -495,7 +495,7 @@ def predict_all(p: Plan) -> None:
     stop = threading.Event()
     by: dict[str, list[Run]] = {}
     for r in p.runs:
-        start(r, p.dataset, p.timeout)
+        prepare(r, p.dataset, p.timeout)
         by.setdefault(harness.resolve(r.provider), []).append(r)
 
     def one(r: Run, g: gold.Page, bar: progress.Reporter, halt: threading.Event) -> None:
@@ -663,11 +663,11 @@ def grade(run: Run, dataset: str, rescore: bool = False, say: Callable[[str], No
     `--limit` chose to predict, so a smaller invocation never shrinks a run's scores; a page with no
     record is pending, not failed. A page's lines are graded again when they aren't `current`: its
     record, the gold (`gold_revision`) or the scorer has changed. Scores are written however grading
-    ends, so an interrupt keeps what was graded. A run that was never started is refused: its folder
+    ends, so an interrupt keeps what was graded. A run that was never prepared is refused: its folder
     is most likely another one (another option, another --out)."""
     if not run.records.is_dir():
         raise ValueError(f"no run at {run.out}: {run.provider} with settings {run.options or 'by default'} "
-                         "was never started there. Check --out and --options, or start it first")
+                         "was never prepared there. Check --out and --options, or prepare it first")
     root, every, tests = load(dataset)
     revision = gold_revision(dataset, root)
     settle(run, gold=revision)

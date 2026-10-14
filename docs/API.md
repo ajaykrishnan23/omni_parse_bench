@@ -312,7 +312,7 @@ from omni_parse_bench import benchmark, gold, harness
 p = benchmark.plan(["dots-mocr"], out="runs")
 (run,) = p.runs
 root, _, tests = benchmark.load(p.dataset)
-benchmark.start(run, p.dataset, p.timeout)
+benchmark.prepare(run, p.dataset, p.timeout)
 for page in p.pages:
     file = benchmark.page_file(p.dataset, root, page.doc_path)
     sha = benchmark.file_digest(file)
@@ -322,14 +322,14 @@ for page in p.pages:
 benchmark.grade(run, p.dataset)
 ```
 
-- `start(run, dataset, timeout)` makes the folder and writes `settings.json`;
+- `prepare(run, dataset, timeout)` makes the folder and writes `settings.json`;
 - `needs(run, page_id, want, page_sha, retry_failed=False)` is what the page still lacks, by the rules
   above (pass `retry_failed=True` for `--retry-failed`);
 - `store(run, page_id, record)` merges a new record into the old one of the same page file, writes it
   and its prediction, and returns it; the record carries `page_sha256`;
 - `record(run, page_id)` reads a page's record, or None; and
 - `grade(run, dataset)` grades the pages recorded so far, writes `scores.jsonl` and `summary.json`, and
-  returns the summary. A page with no record is pending, not failed; a run never started is refused.
+  returns the summary. A page with no record is pending, not failed; a run never prepared is refused.
 
 The folder is then exactly one `opb benchmark` writes, so either can resume or grade it.
 

@@ -161,11 +161,11 @@ def test_retry_failed_asks_again_only_what_may_go_otherwise(failure, error, agai
 # 4. A run's dataset, gold and timeout.
 
 def test_a_loop_of_ones_own_keeps_a_run_through_its_functions(tmp_path, monkeypatch):
-    """start, needs, store and record: what predict_all does per page, for a loop that predicts elsewhere."""
+    """prepare, needs, store and record: predict_all's bookkeeping, for a loop that predicts elsewhere."""
     monkeypatch.setattr(benchmark, "load", lambda d: (tmp_path / "gold-1", (), {}))
     monkeypatch.setattr(benchmark, "gold_revision", lambda d, root: root.name)
     r = benchmark.Run("tesseract", {}, tmp_path / "run")
-    benchmark.start(r, "some/dataset", 900.0)
+    benchmark.prepare(r, "some/dataset", 900.0)
     assert json.loads((r.out / "settings.json").read_text())["gold"] == "gold-1"
     want = frozenset({"html", "blocks"})
     assert benchmark.needs(r, "p1", want, "sha-a") == want
@@ -184,10 +184,10 @@ def test_a_loop_of_ones_own_keeps_a_run_through_its_functions(tmp_path, monkeypa
     assert benchmark.store(r, "p1", first | {"page_sha256": "sha-b"})["calls"] == [call]
 
 
-def test_a_run_never_started_is_not_graded(tmp_path):
+def test_a_run_never_prepared_is_not_graded(tmp_path):
     """Most likely another folder (another option, another --out), so it is refused, not passed over."""
     r = benchmark.Run("tesseract", {}, tmp_path / "nowhere")
-    with pytest.raises(ValueError, match="never started"):
+    with pytest.raises(ValueError, match="never prepared"):
         benchmark.grade(r, "some/dataset")
 
 
