@@ -3,6 +3,7 @@
     opb score --pred outputs.json --gold gold/<page_id>.json
     opb predict --provider datalab --page pages/<page_id>.pdf
     opb benchmark --providers datalab openai/gpt-5.6-sol --dataset hf://datasets/datalab-to/omni_parse_bench
+    opb grade RUN_DIR [--unsupported blocks]           # a folder of predictions/, yours or a run's
     opb tests --dataset <folder or hf://...> > tests.jsonl
     opb providers [NAME]
     opb reparse RUN_DIR ...
@@ -25,11 +26,11 @@ from collections.abc import Sequence
 from pathlib import Path
 from typing import Any
 
-from omni_parse_bench import benchmark, progress
+from omni_parse_bench import benchmark, progress, vocab
 
 # command -> the extra it needs; `score` needs none.
 EXTRAS = {"predict": "harness", "providers": "harness", "reparse": "harness", "benchmark": "benchmark",
-          "tests": "benchmark"}
+          "grade": "benchmark", "tests": "benchmark"}
 
 
 
@@ -200,6 +201,22 @@ def cmd_benchmark(a: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_grade(a: argparse.Namespace) -> int:
+    """Grade a folder of predictions/<page_id>.json, whatever made them, and print its scores and
+    coverage. `--unsupported` says, once for the folder, which outputs its system can't produce; it is
+    kept in the folder's settings.json."""
+    out = Path(a.run)
+    path = out / "settings.json"
+    if a.unsupported is not None:
+        said = {"unsupported": sorted(set(a.unsupported))}
+        benchmark.write_json(path, (benchmark.read_json(path) or {}) | said)
+    run = benchmark.Run((benchmark.read_json(path) or {}).get("provider", out.name), {}, out)
+    s = benchmark.grade(run, a.dataset, rescore=a.rescore, say=lambda m: print(m, file=sys.stderr))
+    print(json.dumps({**{o: v["score"] for o, v in s.items() if isinstance(v, dict) and "score" in v},
+                      "pages": s["pages"], "pages_pending": s["pages_pending"]}, indent=2))
+    return 2 if benchmark.errors_in(s) else 0
+
+
 def cmd_reparse(a: argparse.Namespace) -> int:
     """Read each record's outputs again from its saved answers, with the current adapter code.
 
@@ -267,6 +284,15 @@ def main(argv: Sequence[str] | None = None) -> int:
                         "never a 400 or a vendor's answer")
     b.add_argument("-y", "--yes", action="store_true", help="don't ask before calling vendors")
 
+    g = sub.add_parser("grade", help="grade a folder of predictions/<page_id>.json: yours, or a run's")
+    g.add_argument("run", help="the folder holding predictions/ (and settings.json)")
+    g.add_argument("--dataset", default=benchmark.DEFAULT_DATASET,
+                   help="a dataset folder, or hf://datasets/<repo>[@revision]")
+    g.add_argument("--unsupported", nargs="*", metavar="OUTPUT", choices=vocab.OUTPUT_TYPES,
+                   help="output types your system can't produce, once for the folder (kept in its "
+                        "settings.json); their tests are unsupported, not failed")
+    g.add_argument("--rescore", action="store_true", help="grade every page again, after a scorer change")
+
     tt = sub.add_parser("tests", help="every test as a JSON line, with its page's suite and document")
     tt.add_argument("--dataset", default=benchmark.DEFAULT_DATASET,
                     help="a dataset folder, or hf://datasets/<repo>[@revision]")
@@ -280,8 +306,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     pl.add_argument("provider", nargs="?")
 
     a = ap.parse_args(argv)
-    cmd = {"score": cmd_score, "predict": cmd_predict, "benchmark": cmd_benchmark, "tests": cmd_tests,
-           "providers": cmd_providers, "reparse": cmd_reparse}[a.cmd]
+    cmd = {"score": cmd_score, "predict": cmd_predict, "benchmark": cmd_benchmark, "grade": cmd_grade,
+           "tests": cmd_tests, "providers": cmd_providers, "reparse": cmd_reparse}[a.cmd]
     try:
         return cmd(a)
     except ImportError as exc:
