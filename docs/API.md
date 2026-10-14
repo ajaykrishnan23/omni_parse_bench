@@ -323,8 +323,21 @@ benchmark.grade(run, p.dataset)
 ```
 
 - `prepare(run, dataset, timeout)` makes the folder and writes `settings.json`;
-- `needs(run, page_id, want, page_sha, retry_failed=False)` is what the page still lacks, by the rules
-  above (pass `retry_failed=True` for `--retry-failed`);
+- `needs(run, page_id, want, page_sha, retry_failed=False)` is the outputs to ask `predict` for, and is
+  passed to it as they are. `want` is what the page's tests read (`gold.wants`, usually `{"html",
+  "blocks"}`); `needs` is the part of it the page's record doesn't settle:
+
+  | the page's record | `needs` returns |
+  | --- | --- |
+  | none yet | all of `want` |
+  | of another page file (its `page_sha256` differs) | all of `want` |
+  | without an output, never asked (a gold that added layout tests later; one of an LLM's separate calls cut short) | that output |
+  | with an output failed in a way that may not recur (a timeout, an outage, a 429 or 5xx), with `retry_failed=True` | that output |
+  | with an output recorded as unsupported | nothing for it |
+  | holding all of `want` | nothing, so the page is skipped |
+
+  A page has several outputs, often from separate, paid calls, so the answer is a set, not a yes or no:
+  a resume, `--retry-failed` or a new kind of test asks for what is missing only;
 - `store(run, page_id, record)` merges a new record into the old one of the same page file, writes it
   and its prediction, and returns it; the record carries `page_sha256`;
 - `record(run, page_id)` reads a page's record, or None; and
