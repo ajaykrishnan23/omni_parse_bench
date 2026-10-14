@@ -64,10 +64,11 @@ SCORING = ("gold.py", "vocab.py", "runners.py", "views.py", "normalize.py", "tab
 
 def scorer_version() -> str:
     """The package's version and a digest of its scoring code, stamped on each score line so a run
-    graded by another scorer is known (and refused without --rescore).
+    graded by another scorer is known (and refused without --rescore, `scoring`).
 
     Note: the version alone is the same across every commit between releases, so it can't say the
-    scoring changed; the digest of the files that decide a verdict can.
+    scoring changed; the digest of the files that decide a verdict can. The version is kept for the
+    reader: which release graded a line.
     """
     try:
         version = importlib.metadata.version("omni-parse-bench")
@@ -79,6 +80,12 @@ def scorer_version() -> str:
 
 
 SCORER = scorer_version()
+
+
+def scoring(stamp: str | None) -> str | None:
+    """The scoring code a scorer stamp names: its digest, without the version, so a release that
+    changes no scoring file grades as the one before it did."""
+    return None if stamp is None else stamp.rpartition("+")[2]
 
 
 class Run(NamedTuple):
@@ -225,9 +232,11 @@ def graded_with(scores: dict[str, list[dict]]) -> frozenset[tuple[str | None, st
 
 
 def refuse_regrading(run: Run, revision: str, scores: dict[str, list[dict]]) -> None:
-    """Refuses a run whose score lines were graded with another gold or scorer than this one: grading
-    it again would change its scores, which only `--rescore` does, every page at once, never a mix."""
-    if stale := sorted(graded_with(scores) - {(revision, SCORER)}, key=str):
+    """Refuses a run whose score lines were graded with another gold or scoring code than this one
+    (`scoring`): grading it again would change its scores, which only `--rescore` does, every page at
+    once, never a mix."""
+    now = (revision, scoring(SCORER))
+    if stale := sorted(((g, s) for g, s in graded_with(scores) if (g, scoring(s)) != now), key=str):
         was = ", ".join(f"gold {g} with scorer {s}" for g, s in stale)
         raise ValueError(f"{run.out} was graded against {was}; this is gold {revision} with scorer "
                          f"{SCORER}. Pass --rescore to grade every page again with these (no page is "
