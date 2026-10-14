@@ -551,7 +551,7 @@ def test_a_bad_count_or_an_empty_options_list_is_refused():
             benchmark.plan(["datalab"], dataset="unused", **kwargs)
     with pytest.raises(ValueError, match="empty list"):
         benchmark.plan(["datalab"], dataset="unused", options={"datalab": []})
-    with pytest.raises(SystemExit, match="negative"):
+    with pytest.raises(ValueError, match="negative"):
         cli.main(["benchmark", "--providers", "datalab", "--limit", "-1", "-y"])
 
 

@@ -108,10 +108,24 @@ def manifest(root: str | Path) -> tuple[Page, ...]:
     except ImportError:
         raise ImportError("gold reads the manifest with pyarrow: "
                           "pip install 'omni-parse-bench[benchmark]'") from None
-    rows = tuple(page(r) for r in pq.read_table(Path(root).expanduser() / MANIFEST).to_pylist())
+    table = pq.read_table(Path(root).expanduser() / MANIFEST)
+    if unknown := [c for c in table.column_names if c not in (*PAGE_FIELDS, *OPTIONAL_PAGE_FIELDS)]:
+        raise GoldError(f"the dataset's manifest has columns this omni-parse-bench ({_version()}) doesn't "
+                        f"know: {unknown}. The dataset is newer than this omni-parse-bench; upgrade it: "
+                        f"pip install -U omni-parse-bench")
+    rows = tuple(page(r) for r in table.to_pylist())
     if twice := [i for i, n in collections.Counter(p.page_id for p in rows).items() if n > 1]:
         raise GoldError(f"{len(twice)} page ids are in the manifest more than once, e.g. {twice[:3]}")
     return rows
+
+
+def _version() -> str:
+    import importlib.metadata
+
+    try:
+        return importlib.metadata.version("omni-parse-bench")
+    except importlib.metadata.PackageNotFoundError:
+        return "unknown version"
 
 
 def pages(root: str | Path) -> tuple[Page, ...]:
