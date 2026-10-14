@@ -290,7 +290,9 @@ It's resumable, and safe to run twice.
 - a run graded with another gold or scorer is refused, before any call: grading it again would change
   its scores, so `--rescore` does that, every page at once, never a mix of two. The gold is a digest
   of what grading reads (each page's id, document and suite, and its gold file), so a dataset commit
-  that changes nothing graded (its card, a results table, the derived `outputs`) is the same gold;
+  that changes nothing graded (its card, a results table, the derived `outputs`) is the same gold.
+  The scorer is the digest of the scoring code, so a release that changes no scoring file is the
+  same scorer;
 - grading covers every page the run has a record for, so `--limit` and `--suites` narrow what is
   predicted, never what is scored; and
 - scores are written however grading ends, so an interrupt keeps what was graded.
@@ -591,7 +593,8 @@ and cost:
 
 - `gold` is the gold it was graded against: a digest of each page's id, document and suite and its
   gold file;
-- `scorer` is the package version and a digest of its scoring code, which graded it;
+- `scorer` is the package version and a digest of its scoring code, which graded it; only the
+  digest decides whether a run is refused;
 - `pages` is how many pages were graded, and `pages_pending` how many of the dataset's pages have
   no record yet; and
 - `usd` and `credits` are what the vendor said the calls cost.

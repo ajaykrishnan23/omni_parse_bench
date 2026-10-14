@@ -602,6 +602,18 @@ def test_an_unreadable_record_is_predicted_again_and_a_bad_score_line_graded_aga
     assert len(scores.read_text().splitlines()) == 2
 
 
+def test_a_release_that_changes_no_scoring_code_keeps_a_run(tmp_path, monkeypatch):
+    """The stamp's version is for the reader; only its digest of the scoring code decides a refusal."""
+    use(monkeypatch, {"stub": stub()})
+    p = benchmark.plan(["stub"], out=tmp_path / "runs", dataset=dataset(tmp_path / "data"))
+    benchmark.execute(p, say=QUIET)
+    monkeypatch.setattr(benchmark, "SCORER", "9.9.9+" + benchmark.scoring(benchmark.SCORER))
+    benchmark.grade(p.runs[0], p.dataset)
+    monkeypatch.setattr(benchmark, "SCORER", "9.9.9+another")
+    with pytest.raises(ValueError, match="--rescore"):
+        benchmark.grade(p.runs[0], p.dataset)
+
+
 def test_an_interrupted_regrading_never_mixes_scorers(tmp_path, monkeypatch):
     """An interrupted --rescore keeps the pages it regraded and drops the rest, which the next grading
     grades with the same scorer, so a run's lines never come from two."""
