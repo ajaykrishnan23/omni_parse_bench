@@ -18,7 +18,7 @@ pytest.importorskip("openai")
 
 import httpx  # noqa: E402
 
-from omni_parse_bench import benchmark, cli, harness  # noqa: E402
+from omni_parse_bench import benchmark, cli, gold, harness  # noqa: E402
 from omni_parse_bench.harness import budget, contract, errors, page, registry  # noqa: E402
 from omni_parse_bench.harness.providers import azure, extend, reducto  # noqa: E402
 
@@ -57,8 +57,10 @@ def use(monkeypatch, modules: dict[str, types.ModuleType]) -> None:
     for m in (page, registry): monkeypatch.setattr(m, "adapter", lambda provider: modules[provider])
 
 
-def dataset(root: pathlib.Path, n: int = 1, blocks: bool = False) -> str:
-    """A dataset of `n` pages, each with an html test passing on "alpha" (and a blocks test)."""
+def dataset(root: pathlib.Path, n: int = 1, blocks: bool = False, outputs: list | None = None,
+            extra: dict | None = None) -> str:
+    """A dataset of `n` pages, each with an html test passing on "alpha" (and a blocks test); with
+    `outputs`, the manifest says what to predict for each page, and `extra` adds columns."""
     import pyarrow as pa
     import pyarrow.parquet as pq
 
@@ -77,7 +79,8 @@ def dataset(root: pathlib.Path, n: int = 1, blocks: bool = False) -> str:
                        "settings": {"kind": "text"}})
         (root / "gold" / f"{pid}.json").write_text(json.dumps({"tests": ts}))
         rows.append({"page_id": pid, "document": "a", "suite": "a", "doc_path": f"pages/{pid}.pdf",
-                     "gt_path": f"gold/{pid}.json"})
+                     "gt_path": f"gold/{pid}.json"} | ({"outputs": outputs} if outputs is not None else {})
+                    | (extra or {}))
     pq.write_table(pa.Table.from_pylist(rows), root / "manifest.parquet")
     return str(root)
 
@@ -162,20 +165,21 @@ def test_retry_failed_asks_again_only_what_may_go_otherwise(failure, error, agai
 
 def test_a_loop_of_ones_own_keeps_a_run_through_its_functions(tmp_path, monkeypatch):
     """prepare, needs, record and recorded: predict_all's bookkeeping, for a loop that predicts elsewhere."""
-    monkeypatch.setattr(benchmark, "load", lambda d: (tmp_path / "gold-1", (), {}))
+    monkeypatch.setattr(benchmark, "manifest", lambda d: (tmp_path / "gold-1", ()))
     monkeypatch.setattr(benchmark, "gold_revision", lambda d, root: root.name)
     r = benchmark.Run("tesseract", {}, tmp_path / "run")
     benchmark.prepare(r, "some/dataset", 900.0)
     assert json.loads((r.out / "settings.json").read_text())["gold"] == "gold-1"
-    want = frozenset({"html", "blocks"})
-    assert benchmark.needs(r, "p1", want) == want
+    page = gold.Page("p1", "d1", "suite", "pages/p1.pdf", "gold/p1.json", ("blocks", "html"))
+    want = frozenset(page.outputs)
+    assert benchmark.needs(r, page) == want
     call = {"outputs": ["html", "blocks"], "usd": 0, "wall_s": 1.0}
     first = {"outputs": {"html": "<p>a</p>", "blocks": None}, "calls": [call], "raw": [],
              "errors": {"blocks": "VendorTimeout: timed out"}}
     benchmark.record(r, "p1", first)
     assert json.loads((r.predictions / "p1.json").read_text()) == {"html": "<p>a</p>", "blocks": None}
-    assert benchmark.needs(r, "p1", want) == frozenset()
-    assert benchmark.needs(r, "p1", want, retry_failed=True) == frozenset({"blocks"})
+    assert benchmark.needs(r, page) == frozenset()
+    assert benchmark.needs(r, page, retry_failed=True) == frozenset({"blocks"})
     again = {"outputs": {"blocks": []}, "errors": {}, "calls": [call], "raw": []}
     kept = benchmark.record(r, "p1", again)
     assert kept["outputs"] == {"html": "<p>a</p>", "blocks": []} and kept["errors"] == {}
@@ -218,6 +222,7 @@ def test_a_run_folder_holds_one_dataset_and_records_its_gold(tmp_path, monkeypat
     gold = pathlib.Path(one) / "gold" / "a-p0.json"
     gold.write_text(gold.read_text().replace('"alpha"', '"beta"'))
     benchmark.load.cache_clear()
+    benchmark.manifest.cache_clear()
     benchmark.execute(p, say=QUIET)
     settings = json.loads((run.out / "settings.json").read_text())
     assert len(settings["golds"]) == 2 and settings["golds"][-1] == settings["gold"]
@@ -247,6 +252,48 @@ def test_a_page_already_answered_is_not_fetched_again(tmp_path, monkeypatch):
     (pathlib.Path(data) / "pages" / "a-p0.pdf").write_bytes(b"%PDF another page")
     benchmark.execute(p, say=QUIET)
     assert len(calls) == 1 and fetched == []
+
+
+def test_a_manifest_that_says_what_to_predict_is_planned_without_the_gold(tmp_path, monkeypatch):
+    """With outputs in the manifest, planning and predicting read no gold file; grading does."""
+    calls = []
+    use(monkeypatch, {"stub": stub(call=lambda config: calls.append(1) or contract.Call({"html": "alpha"}))})
+    data = dataset(tmp_path / "data", n=2, outputs=["html"])
+    assert [p.outputs for p in gold.pages(data)] == [("html",), ("html",)]
+    read = []
+    real = gold.read
+    monkeypatch.setattr(gold, "read", lambda path: read.append(path) or real(path))
+    p = benchmark.plan(["stub"], out=tmp_path / "runs", dataset=data)
+    benchmark.predict_all(p)
+    assert len(calls) == 2 and read == [], "planning and predicting read no gold"
+    assert benchmark.grade_all(p, say=QUIET)[p.runs[0].out.name]["pages"] == 2 and read
+
+
+def test_a_manifest_without_outputs_reads_them_from_the_gold(tmp_path):
+    """Every older commit of a dataset stays readable: the column is derived from the tests."""
+    data = dataset(tmp_path / "data", blocks=True)
+    (page,) = gold.pages(data)
+    assert page.outputs == ("blocks", "html")
+
+
+def test_outputs_out_of_step_with_the_gold_are_refused(tmp_path):
+    data = dataset(tmp_path / "data", blocks=True, outputs=["html"])
+    with pytest.raises(gold.GoldError, match="out of step with the gold"):
+        gold.load(data)
+
+
+@pytest.mark.parametrize("outputs", [[], ["html", "html"], ["html", "pdf"]])
+def test_outputs_must_be_distinct_known_output_types(tmp_path, outputs):
+    data = dataset(tmp_path / "data", outputs=outputs)
+    with pytest.raises(gold.GoldError, match="distinct output types"):
+        gold.manifest(data)
+
+
+def test_an_unknown_manifest_column_says_to_upgrade(tmp_path):
+    """What an older omni-parse-bench meets in a newer dataset: the fix is in the message."""
+    data = dataset(tmp_path / "data", extra={"weight": "1"})
+    with pytest.raises(gold.GoldError, match="pip install -U omni-parse-bench"):
+        gold.manifest(data)
 
 
 # 5. The plan counts what will be predicted.
@@ -295,6 +342,7 @@ def test_a_renamed_test_is_graded_again_not_a_crash(tmp_path, monkeypatch):
     gold = pathlib.Path(data) / "gold" / "a-p0.json"
     gold.write_text(gold.read_text().replace('"t0"', '"t0-renamed"'))
     benchmark.load.cache_clear()
+    benchmark.manifest.cache_clear()
     (s,) = benchmark.execute(p._replace(score_only=True), say=QUIET).values()
     assert s["html"]["score"] == 1.0
     lines = [json.loads(x) for x in (p.runs[0].out / "scores.jsonl").read_text().splitlines()]

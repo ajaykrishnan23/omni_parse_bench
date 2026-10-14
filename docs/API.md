@@ -308,14 +308,14 @@ itself. A `benchmark.Run` is an address, as a `Path` is: what the run holds is w
 holds when it is read.
 
 ```python
-from omni_parse_bench import benchmark, gold, harness
+from omni_parse_bench import benchmark, harness
 
 p = benchmark.plan(["dots-mocr"], out="runs")
 (run,) = p.runs
-root, _, tests = benchmark.load(p.dataset)
+root, _ = benchmark.manifest(p.dataset)
 benchmark.prepare(run, p.dataset, p.timeout)
 for page in p.pages:
-    if need := benchmark.needs(run, page.page_id, gold.wants(tests[page.page_id])):
+    if need := benchmark.needs(run, page):
         file = benchmark.page_file(p.dataset, root, page.doc_path)
         result = harness.predict(run.provider, file, need, timeout=p.timeout, **run.options)  # wherever
         benchmark.record(run, page.page_id, result)
@@ -323,17 +323,17 @@ benchmark.grade(run, p.dataset)
 ```
 
 - `prepare(run, dataset, timeout)` makes the folder and writes `settings.json`;
-- `needs(run, page_id, want, retry_failed=False)` is the outputs to ask `predict` for, and is
-  passed to it as they are. `want` is what the page's tests read (`gold.wants`, usually `{"html",
-  "blocks"}`); `needs` is the part of it the page's record doesn't settle:
+- `needs(run, page, retry_failed=False)` is the outputs to ask `predict` for, and is passed to it as
+  they are. `page` is a manifest row; its `outputs` say what to predict (usually `["html"]` or
+  `["html", "blocks"]`), and `needs` is the part of them the page's record doesn't settle:
 
   | the page's record | `needs` returns |
   | --- | --- |
-  | none yet | all of `want` |
+  | none yet | all of its `outputs` |
   | without an output, never asked (a gold that added layout tests later; one of an LLM's separate calls cut short) | that output |
   | with an output failed in a way that may not recur (a timeout, an outage, a 429 or 5xx), with `retry_failed=True` | that output |
   | with an output recorded as unsupported | nothing for it |
-  | holding all of `want` | nothing, so the page is skipped |
+  | holding all of its `outputs` | nothing, so the page is skipped |
 
   A page has several outputs, often from separate, paid calls, so the answer is a set, not a yes or no:
   a resume, `--retry-failed` or a new kind of test asks for what is missing only. A loop that asks for
@@ -398,7 +398,7 @@ loop over `score` (see [The dataset](#the-dataset)).
 ## The dataset
 
 ```
-manifest.parquet        one row per page: page_id, document, suite, doc_path, gt_path
+manifest.parquet        one row per page: page_id, document, suite, doc_path, gt_path, outputs
 pages/<page_id>.pdf     the page that gets sent (or .png)
 gold/<page_id>.json     its tests: {"tests": [...]}
 ```
@@ -406,7 +406,9 @@ gold/<page_id>.json     its tests: {"tests": [...]}
 The dataset is the source of truth: a correction is an edit to a gold file, and a dropped page is
 removed with its files and its manifest row. The pages' licenses are in `licenses/`.
 
-`gold.load` reads it all, checked (it needs the benchmark extra, for parquet):
+`gold.pages` reads the manifest alone: every page, with what to predict for it (`outputs`).
+`gold.tests(root, page)` reads one page's tests. `gold.load` reads it all, checked (each needs the
+benchmark extra, for parquet):
 
 ```python
 from omni_parse_bench import gold, score, summarize
@@ -415,7 +417,7 @@ pages, tests = gold.load("dataset/")
 pages[0]
 # Page(page_id='olmo_arxiv_math-2502.15977_pg21-p1', document='olmo_arxiv_math:2502.15977',
 #      suite='olmo_arxiv_math', doc_path='pages/olmo_arxiv_math-2502.15977_pg21-p1.pdf',
-#      gt_path='gold/olmo_arxiv_math-2502.15977_pg21-p1.json')
+#      gt_path='gold/olmo_arxiv_math-2502.15977_pg21-p1.json', outputs=('html',))
 tests[0]
 # Test(id='2502.15977_pg21_math_003', page_id='olmo_arxiv_math-2502.15977_pg21-p1', test_type='present',
 #      output_type='html', derivation='upstream_olmocr', tags=('math',),
@@ -428,12 +430,14 @@ Grading your own model is a loop over pages:
 by_page = gold.by_page(tests)
 verdicts = []
 for p in pages:
-    outputs = my_model("dataset/" + p.doc_path, gold.wants(by_page[p.page_id]))
+    outputs = my_model("dataset/" + p.doc_path, p.outputs)
     verdicts += score(outputs, by_page[p.page_id])
 summary = summarize(verdicts, tests, pages)
 ```
 
-`gold.wants` is the set of outputs a page's tests read. `gold.read(path)` reads one gold file.
+`p.outputs` is what to predict for the page: the outputs its tests read (`gold.wants`). A manifest
+from before the column has it read from the gold, and a manifest whose `outputs` disagree with the
+gold is refused. `gold.read(path)` reads one gold file.
 
 ### Exploring the tests
 

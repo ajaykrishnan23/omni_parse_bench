@@ -89,7 +89,7 @@ class Run(NamedTuple):
     machine, another scheduler) keeps a run exactly as `predict_all` does:
 
         prepare(run, dataset, timeout)                # once: the folder, and settings.json
-        need = needs(run, page_id, want)              # the outputs the page's record still lacks
+        need = needs(run, page)                       # the outputs the page's record still lacks
         record(run, page_id, harness.predict(...))    # the page's new result, merged and written
         grade(run, dataset)                           # scores.jsonl and summary.json, as they stand
 
@@ -114,7 +114,7 @@ def prepare(run: Run, dataset: str, timeout: float) -> None:
     settings, dataset, the gold revision it is read against and the timeout per call."""
     from omni_parse_bench import harness
 
-    root, _, _ = load(dataset)
+    root, _ = manifest(dataset)
     run.records.mkdir(parents=True, exist_ok=True)
     run.predictions.mkdir(exist_ok=True)
     settle(run, run=run.out.name, provider=run.provider,
@@ -127,10 +127,11 @@ def recorded(run: Run, page_id: str) -> dict | None:
     return None if (got := read_record(run.records / f"{page_id}.json")) is None else got[0]
 
 
-def needs(run: Run, page_id: str, want: frozenset[str], retry_failed: bool = False) -> frozenset[str]:
-    """The outputs in `want` (what the page's tests read, `gold.wants`) the run still lacks for the
-    page: `missing` over its record."""
-    return missing(recorded(run, page_id), want, retry_failed)
+def needs(run: Run, page: gold.Page, retry_failed: bool = False) -> frozenset[str]:
+    """The outputs the run still lacks for the page: of those the manifest says to predict for it
+    (`page.outputs`), what its record doesn't settle (`missing`)."""
+    assert page.outputs is not None, "pages come from manifest(), which fills outputs in"
+    return missing(recorded(run, page.page_id), frozenset(page.outputs), retry_failed)
 
 
 def record(run: Run, page_id: str, new: dict) -> dict:
@@ -214,6 +215,14 @@ def gold_revision(dataset: str, root: Path) -> str:
 
 
 @functools.cache
+def manifest(dataset: str) -> tuple[Path, tuple[gold.Page, ...]]:
+    """The dataset's folder and its pages, each with what to predict for it, read once per process: from
+    the manifest alone when it says (`gold.pages`), so planning and predicting read no gold file."""
+    root = dataset_root(dataset)
+    return root, gold.pages(root)
+
+
+@functools.cache
 def load(dataset: str) -> tuple[Path, tuple[gold.Page, ...], dict[str, tuple[gold.Test, ...]]]:
     """The dataset's folder, its pages, and each page's tests by page id; read once per process."""
     root = dataset_root(dataset)
@@ -241,7 +250,7 @@ def pages(dataset: str, suites: list[str] | None = None, limit: int = 0,
 
     `sample` picks that many pages spread over every suite: suites in turn, each page evenly spaced
     within its suite, so a smoke test sees every kind of page and the same pages each time."""
-    root, rows, _ = load(str(dataset))
+    root, rows = manifest(str(dataset))
     known = {r.suite for r in rows}
     if bad := sorted(set(suites or ()) - known):
         raise ValueError(f"unknown suites {bad}; the dataset's suites are {sorted(known)}")
@@ -344,7 +353,7 @@ def owed(p: Plan, r: Run, revision: str) -> tuple[int, int]:
     for g in p.pages:
         got = read_record(r.records / f"{g.page_id}.json")
         record, text = got if got is not None else (None, "")
-        coming = not p.score_only and bool(missing(record, gold.wants(tests[g.page_id]), p.retry_failed))
+        coming = not p.score_only and bool(missing(record, frozenset(g.outputs), p.retry_failed))
         predict += coming
         grade += coming or (record is not None and not current(rows.get(g.page_id), text, revision,
                                                                  tests[g.page_id]))
@@ -468,7 +477,7 @@ def predict_all(p: Plan) -> None:
     one pool (`workers_for`), the adapters go at once, and a live table shows each run (`progress.py`)."""
     from omni_parse_bench import harness, progress
 
-    root, _, tests = load(p.dataset)
+    root, _ = manifest(p.dataset)
     # Note: set on an interrupt, so no run starts another page; a call already made is let finish.
     stop = threading.Event()
     by: dict[str, list[Run]] = {}
@@ -478,7 +487,7 @@ def predict_all(p: Plan) -> None:
 
     def one(r: Run, g: gold.Page, bar: progress.Reporter, halt: threading.Event) -> None:
         if stop.is_set() or halt.is_set(): return
-        if not (asked := needs(r, g.page_id, gold.wants(tests[g.page_id]), p.retry_failed)):
+        if not (asked := needs(r, g, p.retry_failed)):
             bar.kept()
             return
         try:
