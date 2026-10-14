@@ -281,17 +281,21 @@ It's resumable, and safe to run twice.
   and pages are pinned to a dataset commit and never edited in place. To predict again after a
   dataset's pages change, use a new `--out`;
 - a record that isn't readable JSON counts as not predicted, and is logged;
-- a page is graded again when its lines in `scores.jsonl` are missing, unreadable or out of date: its
-  record, the gold or the scorer version differs, or the page's test ids have changed;
+- a page is graded again when its lines in `scores.jsonl` are missing or unreadable, or its record
+  has changed (it was predicted again);
+- a run graded with another gold or scorer is refused, before any call: grading it again would change
+  its scores, so `--rescore` does that, every page at once, never a mix of two. The gold is a digest
+  of what grading reads (each page's id, document and suite, and its gold file), so a dataset commit
+  that changes nothing graded (its card, a results table, the derived `outputs`) is the same gold;
 - grading covers every page the run has a record for, so `--limit` and `--suites` narrow what is
   predicted, never what is scored; and
 - scores are written however grading ends, so an interrupt keeps what was graded.
 
-A run folder holds one dataset: an invocation with another `--dataset` into it is refused. A change
-of gold (a new commit of the same dataset) is allowed, regrades the run and is kept in
-`settings.json`. Pages are fetched at the commit the gold was read at.
+A run folder holds one dataset: an invocation with another `--dataset` into it is refused. Pages are
+fetched at the dataset commit the run reads.
 
-`--rescore` grades every page again. `--score-only` predicts nothing. `--retry-failed` predicts again
+`--rescore` grades every page again, with this opb's scorer against this dataset's gold, and predicts
+nothing again; grading is local and cheap. `--score-only` predicts nothing. `--retry-failed` predicts again
 the outputs whose failure may not recur: a timeout, an outage, a 429 or 5xx (Cloudflare's 520 to 524
 too), or a failure with no HTTP status. A 400, a vendor's failed job, or an LLM reply that was
 truncated, refused or unusable is an answer, and is not retried.
@@ -553,19 +557,21 @@ accurate. The digest isn't meant to be read; `settings.json` is.
 
 ### settings.json
 
-What the run is, written before the first page, so an interrupted run still says what it is.
+What the run asks, written before the first page, so an interrupted run still says what it is; and,
+once graded, what graded it.
 
 ```json
 {"run": "datalab-296b76d9", "provider": "datalab",
  "settings": {"mode": "balanced", "base_url": "https://www.datalab.to", "poll_interval": 2.0},
- "dataset": "hf://datasets/datalab-to/omni_parse_bench", "gold": "857550728dd99df40d2139946d99f711568ed529",
- "timeout_s": 900}
+ "dataset": "hf://datasets/datalab-to/omni_parse_bench", "commit": "175cc91a9df1a8d1ee2339ad652d3dce20852911",
+ "timeout_s": 900, "gold": "fb8cb369b9538d1a", "scorer": "0.1.1+a09ce5ecf32a"}
 ```
 
 - `settings` is the whole resolved configuration, not just what you passed;
 - `dataset` is the dataset's repo, or a folder's path: a later invocation with another is refused;
-- `gold` is the gold last graded against, and `golds`, once it has changed, every one in order; and
-- `timeout_s` is the latest invocation's; each call in a record keeps its own.
+  `commit` is the Hugging Face commit the run reads;
+- `timeout_s` is the latest invocation's; each call in a record keeps its own; and
+- `gold` and `scorer` are what the run was graded with; only `--rescore` changes them.
 
 ### summary.json
 
@@ -575,13 +581,13 @@ and cost:
 ```json
 {"headline": {"...": "..."}, "html": {"...": "..."}, "blocks": {"...": "..."},
  "per_suite": {"...": "..."}, "per_derivation": {"...": "..."},
- "gold": "857550728dd99df40d2139946d99f711568ed529",
+ "gold": "fb8cb369b9538d1a",
  "scorer": "0.1.1+a09ce5ecf32a", "pages": 2937, "pages_pending": 0, "usd": 13.668,
  "credits": 0}
 ```
 
-- `gold` is the gold it was graded against: the Hugging Face commit, or a digest of a folder's
-  manifest and gold files;
+- `gold` is the gold it was graded against: a digest of each page's id, document and suite and its
+  gold file;
 - `scorer` is the package version and a digest of its scoring code, which graded it;
 - `pages` is how many pages were graded, and `pages_pending` how many of the dataset's pages have
   no record yet; and
@@ -608,11 +614,12 @@ One line per test, in manifest order: its verdict, what the test is, and the sta
  "suite": "olmo_arxiv_math", "document": "olmo_arxiv_math:2502.15977",
  "test_id": "2502.15977_pg21_math_003", "test_type": "present", "output_type": "html",
  "derivation": "upstream_olmocr", "tags": ["math"], "result": "pass", "why": "",
- "record": "5f0c...", "gold": "857550728dd99df40d2139946d99f711568ed529", "scorer": "0.1.1+a09ce5ecf32a"}
+ "record": "5f0c...", "gold": "fb8cb369b9538d1a", "scorer": "0.1.1+a09ce5ecf32a"}
 ```
 
 - `run` and `provider` name the run (its folder) and its provider; `settings.json` has the rest;
 - `page_id` to `tags` say what the test is (`opb tests` writes the same, its id as `id`);
 - `result` is `pass`, `fail`, `unsupported` or `error`, and `why` says what went wrong; and
-- `record`, `gold` and `scorer` stamp what was graded and by what: a line whose stamps are out of
-  date is graded again on the next `opb benchmark`.
+- `record`, `gold` and `scorer` stamp what was graded and by what: a line whose record changed is
+  graded again on the next `opb benchmark`, and a run whose lines were graded with another gold or
+  scorer is refused until `--rescore`.

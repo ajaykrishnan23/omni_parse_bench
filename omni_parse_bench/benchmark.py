@@ -21,9 +21,9 @@ A run directory holds:
                                  document, type, tags, ...), and the stamps of what graded it
     summary.json                 metric.summarize over every graded page, plus cost and coverage
 
-Resumable: a page is predicted again only for the outputs its record lacks (or all of them when its
-page file has changed), and graded again only when its lines are missing or out of date: its
-record, gold or scorer version differs. A run never mixes datasets. Concurrency is per adapter, not per run:
+Resumable: a page is predicted again only for the outputs its record lacks, and graded again only
+when its lines are missing or its record changed. A run never mixes datasets, golds or scorers: one
+graded with another gold or scorer is refused unless --rescore. Concurrency is per adapter, not per run:
 every run of one adapter (two datalab modes, every OpenRouter model) shares one pool of `workers_for`
 its adapter. Credentials come from the environment and everything else from `--options`.
 
@@ -64,8 +64,8 @@ SCORING = ("gold.py", "vocab.py", "runners.py", "views.py", "normalize.py", "tab
 
 
 def scorer_version() -> str:
-    """The package's version and a digest of its scoring code, stamped on each score line so a new
-    scorer regrades.
+    """The package's version and a digest of its scoring code, stamped on each score line so a run
+    graded by another scorer is known (and refused without --rescore).
 
     Note: the version alone is the same across every commit between releases, so it can't say the
     scoring changed; the digest of the files that decide a verdict can.
@@ -110,16 +110,18 @@ class Run(NamedTuple):
 
 
 def prepare(run: Run, dataset: str, timeout: float) -> None:
-    """The run's folder made, and what the run is written to its settings.json (`settle`): provider,
-    settings, dataset, the gold revision it is read against and the timeout per call."""
+    """The run's folder made, and what the run asks written to its settings.json (`settle`): provider,
+    settings, dataset (and the commit of a Hugging Face one) and the timeout per call. Which gold and
+    scorer it was graded with, `grade` writes."""
     from omni_parse_bench import harness
 
     root, _ = manifest(dataset)
     run.records.mkdir(parents=True, exist_ok=True)
     run.predictions.mkdir(exist_ok=True)
+    commit = {"commit": root.name} if str(dataset).startswith(HF_PREFIX) else {}
     settle(run, run=run.out.name, provider=run.provider,
            settings=harness.settings_for(run.provider, run.options), dataset=dataset_id(dataset),
-           gold=gold_revision(dataset, root), timeout_s=timeout)
+           **commit, timeout_s=timeout)
 
 
 def recorded(run: Run, page_id: str) -> dict | None:
@@ -203,15 +205,33 @@ def dataset_id(dataset: str | Path) -> str:
     return str(Path(dataset).expanduser().resolve())
 
 
-def gold_revision(dataset: str, root: Path) -> str:
-    """Which gold a run is graded against: the Hugging Face commit, or a digest of a folder's gold."""
-    if str(dataset).startswith(HF_PREFIX): return root.name   # snapshot_download's folder is the commit
-    # Note: the manifest is in it too: its documents decide the document counts.
-    h = hashlib.sha256((root / gold.MANIFEST).read_bytes())
-    for f in sorted((root / "gold").glob("*.json")):
-        h.update(f.name.encode())
-        h.update(f.read_bytes())
+@functools.cache
+def gold_revision(dataset: str) -> str:
+    """Which gold a run is graded against: a digest of what grading reads, each page's id, document and
+    suite (they decide the counts) and its gold file. So a dataset commit that changes nothing graded (a
+    card, a results table, the derived `outputs` column) is the same gold."""
+    root, ps = manifest(dataset)
+    h = hashlib.sha256()
+    for p in sorted(ps, key=lambda p: p.page_id):
+        h.update(json.dumps([p.page_id, p.document, p.suite]).encode())
+        h.update((root / p.gt_path).read_bytes())
     return h.hexdigest()[:16]
+
+
+def graded_with(run: Run) -> frozenset[tuple[str | None, str | None]]:
+    """The (gold, scorer) pairs the run's score lines were graded with; none before its first grading."""
+    return frozenset((x.get("gold"), x.get("scorer"))
+                     for xs in read_scores(run.out / "scores.jsonl").values() for x in xs)
+
+
+def refuse_regrading(run: Run, revision: str) -> None:
+    """Refuses a run graded with another gold or scorer than this one: grading it again would change
+    its scores, which only `--rescore` does, every page at once, never a mix of the two."""
+    if stale := sorted(graded_with(run) - {(revision, SCORER)}, key=str):
+        was = ", ".join(f"gold {g} with scorer {s}" for g, s in stale)
+        raise ValueError(f"{run.out} was graded against {was}; this is gold {revision} with scorer "
+                         f"{SCORER}. Pass --rescore to grade every page again with these (no page is "
+                         "predicted again), or use the opb and dataset it was graded with")
 
 
 @functools.cache
@@ -308,6 +328,9 @@ def plan(providers: list[str], *, out: str | Path = Path("runs"), dataset: str =
         if (was := (read_json(r.out / "settings.json") or {}).get("dataset", ident)) != ident:
             raise ValueError(f"{r.out} is a run on dataset {was}, not {ident}, and a run never mixes "
                              f"datasets; pass another --out, or --dataset {was}")
+    # Note: refused here, before any call, not after hours of predictions; grade checks again.
+    if not rescore and any((r.out / "scores.jsonl").exists() for r in runs):
+        for r in runs: refuse_regrading(r, gold_revision(str(dataset)))
     return Plan(runs, ps, str(dataset), timeout or harness.DEFAULT_TIMEOUT, workers, rescore, score_only,
                 retry_failed)
 
@@ -370,8 +393,7 @@ def plan_view(p: Plan):
 
     from omni_parse_bench import harness
 
-    root, _, _ = load(p.dataset)
-    revision = gold_revision(p.dataset, root)
+    revision = gold_revision(p.dataset)
 
     table = Table(box=box.ROUNDED, header_style="dim", expand=False)
     table.add_column("adapter", overflow="fold")
@@ -464,12 +486,7 @@ def read_scores(path: Path) -> dict[str, list[dict]]:
 def settle(r: Run, **facts: Any) -> None:
     """`facts` written into the run's settings.json, beside what it already says."""
     path = r.out / "settings.json"
-    was = read_json(path) or {}
-    now = was | facts
-    if (g := facts.get("gold")) and was.get("gold") not in (None, g):
-        # Note: a gold change regrades the run; the golds it has been read against are kept in order.
-        now["golds"] = [*was.get("golds", [was["gold"]]), g]
-    write_json(path, now)
+    write_json(path, (read_json(path) or {}) | facts)
 
 
 def predict_all(p: Plan) -> None:
@@ -638,15 +655,18 @@ def grade(run: Run, dataset: str, rescore: bool = False, say: Callable[[str], No
     Grading covers every page of the dataset the run has a record for, whatever `--suites` and
     `--limit` chose to predict, so a smaller invocation never shrinks a run's scores; a page with no
     record is pending, not failed. A page's lines are graded again when they aren't `current`: its
-    record, the gold (`gold_revision`) or the scorer has changed. Scores are written however grading
-    ends, so an interrupt keeps what was graded. A run that was never prepared is refused: its folder
+    record or the page's tests have changed. A run graded with another gold or scorer is refused
+    (`refuse_regrading`) unless `rescore`, which grades every page again; the gold and scorer it
+    was graded with are written to its settings.json. Scores are written however grading ends, so an
+    interrupt keeps what was graded. A run that was never prepared is refused: its folder
     is most likely another one (another option, another --out)."""
     if not run.records.is_dir():
         raise ValueError(f"no run at {run.out}: {run.provider} with settings {run.options or 'by default'} "
                          "was never prepared there. Check --out and --options, or prepare it first")
     root, every, tests = load(dataset)
-    revision = gold_revision(dataset, root)
-    settle(run, gold=revision)
+    revision = gold_revision(dataset)
+    if not rescore: refuse_regrading(run, revision)
+    settle(run, gold=revision, scorer=SCORER)
     path = run.out / "scores.jsonl"
     old = {} if rescore else read_scores(path)
     lines_of, seen, calls = {}, set(), []

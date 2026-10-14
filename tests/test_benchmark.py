@@ -166,10 +166,10 @@ def test_retry_failed_asks_again_only_what_may_go_otherwise(failure, error, agai
 def test_a_loop_of_ones_own_keeps_a_run_through_its_functions(tmp_path, monkeypatch):
     """prepare, needs, record and recorded: predict_all's bookkeeping, for a loop that predicts elsewhere."""
     monkeypatch.setattr(benchmark, "manifest", lambda d: (tmp_path / "gold-1", ()))
-    monkeypatch.setattr(benchmark, "gold_revision", lambda d, root: root.name)
     r = benchmark.Run("tesseract", {}, tmp_path / "run")
     benchmark.prepare(r, "some/dataset", 900.0)
-    assert json.loads((r.out / "settings.json").read_text())["gold"] == "gold-1"
+    settings = json.loads((r.out / "settings.json").read_text())
+    assert settings["timeout_s"] == 900.0 and "gold" not in settings, "grade writes the gold it graded with"
     page = gold.Page("p1", "d1", "suite", "pages/p1.pdf", "gold/p1.json", ("blocks", "html"))
     want = frozenset(page.outputs)
     assert benchmark.needs(r, page) == want
@@ -216,16 +216,30 @@ def test_a_run_folder_holds_one_dataset_and_records_its_gold(tmp_path, monkeypat
     (run,) = p.runs
     settings = json.loads((run.out / "settings.json").read_text())
     assert settings["dataset"] == benchmark.dataset_id(one) and settings["timeout_s"] == 30
-    assert settings["gold"] == benchmark.gold_revision(one, pathlib.Path(one))
+    assert settings["gold"] == benchmark.gold_revision(one) and settings["scorer"] == benchmark.SCORER
     with pytest.raises(ValueError, match="never mixes datasets"):
         benchmark.plan(["stub"], out=tmp_path / "runs", dataset=two)
     gold = pathlib.Path(one) / "gold" / "a-p0.json"
     gold.write_text(gold.read_text().replace('"alpha"', '"beta"'))
-    benchmark.load.cache_clear()
-    benchmark.manifest.cache_clear()
-    benchmark.execute(p, say=QUIET)
+    for f in (benchmark.load, benchmark.manifest, benchmark.gold_revision): f.cache_clear()
+    with pytest.raises(ValueError, match="--rescore"):
+        benchmark.plan(["stub"], out=tmp_path / "runs", dataset=one)
+    benchmark.execute(benchmark.plan(["stub"], out=tmp_path / "runs", dataset=one, rescore=True), say=QUIET)
     settings = json.loads((run.out / "settings.json").read_text())
-    assert len(settings["golds"]) == 2 and settings["golds"][-1] == settings["gold"]
+    assert settings["gold"] == benchmark.gold_revision(one) and "golds" not in settings
+
+
+def test_a_dataset_change_that_grades_nothing_differently_is_the_same_gold(tmp_path):
+    """A card, a results table or the derived outputs column change the commit, not the gold."""
+    a = dataset(tmp_path / "a")
+    b = dataset(tmp_path / "b", outputs=["html"])
+    assert benchmark.gold_revision(a) == benchmark.gold_revision(b)
+    c = dataset(tmp_path / "c")
+    gold = pathlib.Path(c) / "gold" / "a-p0.json"
+    gold.write_text(gold.read_text().replace('"alpha"', '"beta"'))
+    assert benchmark.gold_revision(c) != benchmark.gold_revision(a)
+
+
 
 
 def test_each_call_keeps_the_timeout_it_ran_under(tmp_path, monkeypatch):
@@ -304,7 +318,7 @@ def test_the_plan_counts_what_will_be_predicted(tmp_path, monkeypatch):
     data = dataset(tmp_path / "data", blocks=True)
     p = benchmark.plan(["stub"], out=tmp_path / "runs", dataset=data)
     (run,) = p.runs
-    revision = benchmark.gold_revision(data, pathlib.Path(data))
+    revision = benchmark.gold_revision(data)
     assert benchmark.owed(p, run, revision) == (1, 1)
     benchmark.execute(p, say=QUIET)
     assert saved(run)["errors"]["blocks"] == "unsupported"
@@ -315,7 +329,8 @@ def test_the_plan_counts_what_will_be_predicted(tmp_path, monkeypatch):
 
 # 6. Score lines carry the gold and scorer that graded them.
 
-def test_rows_are_graded_again_when_the_scorer_changes_without_a_summary(tmp_path, monkeypatch):
+def test_a_run_graded_by_another_scorer_is_refused_unless_rescored(tmp_path, monkeypatch):
+    """A new scorer changes scores, which only --rescore does, every page at once, never a mix."""
     use(monkeypatch, {"stub": stub()})
     p = benchmark.plan(["stub"], out=tmp_path / "runs", dataset=dataset(tmp_path / "data", 2))
     (s,) = benchmark.execute(p, say=QUIET).values()
@@ -323,27 +338,34 @@ def test_rows_are_graded_again_when_the_scorer_changes_without_a_summary(tmp_pat
     rows = [json.loads(x) for x in (run.out / "scores.jsonl").read_text().splitlines()]
     assert {r["scorer"] for r in rows} == {benchmark.SCORER} and s["scorer"] == benchmark.SCORER
     assert {r["gold"] for r in rows} == {s["gold"]}
-    (run.out / "summary.json").unlink()
     monkeypatch.setattr(benchmark, "SCORER", "next")
+    with pytest.raises(ValueError, match="--rescore"):
+        benchmark.plan(["stub"], out=tmp_path / "runs", dataset=p.dataset)
+    with pytest.raises(ValueError, match="--rescore"):
+        benchmark.grade(run, p.dataset)
     graded = []
     real = benchmark.grade_page
     monkeypatch.setattr(benchmark, "grade_page", lambda *a: graded.append(1) or real(*a))
-    benchmark.execute(p._replace(score_only=True), say=QUIET)
+    benchmark.execute(p._replace(score_only=True, rescore=True), say=QUIET)
     assert len(graded) == 2
     rows = [json.loads(x) for x in (run.out / "scores.jsonl").read_text().splitlines()]
     assert {r["scorer"] for r in rows} == {"next"}
 
 
-def test_a_renamed_test_is_graded_again_not_a_crash(tmp_path, monkeypatch):
+
+
+def test_a_renamed_test_is_a_gold_change(tmp_path, monkeypatch):
+    """Renaming a test changes the gold: refused, then graded under its new name with --rescore."""
     use(monkeypatch, {"stub": stub()})
     data = dataset(tmp_path / "data")
     p = benchmark.plan(["stub"], out=tmp_path / "runs", dataset=data)
     benchmark.execute(p, say=QUIET)
     gold = pathlib.Path(data) / "gold" / "a-p0.json"
     gold.write_text(gold.read_text().replace('"t0"', '"t0-renamed"'))
-    benchmark.load.cache_clear()
-    benchmark.manifest.cache_clear()
-    (s,) = benchmark.execute(p._replace(score_only=True), say=QUIET).values()
+    for f in (benchmark.load, benchmark.manifest, benchmark.gold_revision): f.cache_clear()
+    with pytest.raises(ValueError, match="--rescore"):
+        benchmark.execute(p._replace(score_only=True), say=QUIET)
+    (s,) = benchmark.execute(p._replace(score_only=True, rescore=True), say=QUIET).values()
     assert s["html"]["score"] == 1.0
     lines = [json.loads(x) for x in (p.runs[0].out / "scores.jsonl").read_text().splitlines()]
     assert [x["test_id"] for x in lines] == ["t0-renamed"]
@@ -554,7 +576,9 @@ def test_an_unreadable_record_is_predicted_again_and_a_bad_score_line_graded_aga
     assert len(scores.read_text().splitlines()) == 2
 
 
-def test_an_interrupted_grading_keeps_what_it_graded(tmp_path, monkeypatch):
+def test_an_interrupted_regrading_never_mixes_scorers(tmp_path, monkeypatch):
+    """An interrupted --rescore keeps the pages it regraded and drops the rest, which the next grading
+    grades with the same scorer, so a run's lines never come from two."""
     use(monkeypatch, {"stub": stub()})
     p = benchmark.plan(["stub"], out=tmp_path / "runs", dataset=dataset(tmp_path / "data", 3))
     benchmark.execute(p, say=QUIET)
@@ -568,10 +592,16 @@ def test_an_interrupted_grading_keeps_what_it_graded(tmp_path, monkeypatch):
 
     monkeypatch.setattr(benchmark, "grade_page", once)
     with pytest.raises(KeyboardInterrupt):
-        benchmark.execute(p._replace(score_only=True), say=QUIET)
+        benchmark.execute(p._replace(score_only=True, rescore=True), say=QUIET)
     rows = [json.loads(x) for x in (p.runs[0].out / "scores.jsonl").read_text().splitlines()]
-    assert [r["page_id"] for r in rows] == ["a-p0", "a-p1", "a-p2"], "a page not yet regraded keeps its row"
-    assert [r["scorer"] == "next" for r in rows] == [True, False, False]
+    assert [(r["page_id"], r["scorer"]) for r in rows] == [("a-p0", "next")]
+    monkeypatch.setattr(benchmark, "grade_page", real)
+    benchmark.execute(p._replace(score_only=True), say=QUIET)
+    rows = [json.loads(x) for x in (p.runs[0].out / "scores.jsonl").read_text().splitlines()]
+    assert [r["page_id"] for r in rows] == ["a-p0", "a-p1", "a-p2"]
+    assert {r["scorer"] for r in rows} == {"next"}
+
+
 
 
 def test_the_scorer_stamp_changes_with_the_scoring_code(tmp_path, monkeypatch):
@@ -619,7 +649,8 @@ def test_a_page_of_several_tests_is_graded_again_whole_and_only_when_stale(tmp_p
     graded = graded_pages(monkeypatch)
     benchmark.execute(p._replace(score_only=True), say=QUIET)
     assert graded == []
-    lines[1]["scorer"] = "old"   # a-p0: one stale line; a-p1: one line lost
+    rec = run.records / "a-p0.json"     # a-p0: its record changed; a-p1: one line lost
+    rec.write_text(json.dumps(json.loads(rec.read_text()), indent=1))
     path.write_text("".join(json.dumps(x) + "\n" for x in lines[:3]))
     benchmark.execute(p._replace(score_only=True), say=QUIET)
     assert graded == ["a-p0", "a-p1"]
