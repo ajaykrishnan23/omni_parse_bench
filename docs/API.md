@@ -317,8 +317,8 @@ for page in p.pages:
     file = benchmark.page_file(p.dataset, root, page.doc_path)
     sha = benchmark.file_digest(file)
     if need := benchmark.needs(run, page.page_id, gold.wants(tests[page.page_id]), sha):
-        record = harness.predict(run.provider, file, need, timeout=p.timeout, **run.options)
-        benchmark.store(run, page.page_id, record | {"page_sha256": sha})  # wherever it ran
+        result = harness.predict(run.provider, file, need, timeout=p.timeout, **run.options)
+        benchmark.record(run, page.page_id, result | {"page_sha256": sha})  # wherever it ran
 benchmark.grade(run, p.dataset)
 ```
 
@@ -337,10 +337,12 @@ benchmark.grade(run, p.dataset)
   | holding all of `want` | nothing, so the page is skipped |
 
   A page has several outputs, often from separate, paid calls, so the answer is a set, not a yes or no:
-  a resume, `--retry-failed` or a new kind of test asks for what is missing only;
-- `store(run, page_id, record)` merges a new record into the old one of the same page file, writes it
-  and its prediction, and returns it; the record carries `page_sha256`;
-- `record(run, page_id)` reads a page's record, or None; and
+  a resume, `--retry-failed` or a new kind of test asks for what is missing only. A loop that asks for
+  everything every time can skip `needs`; it is what makes a loop resumable;
+- `record(run, page_id, result)` writes: it merges a new result (a `predict` record carrying
+  `page_sha256`) into what the run has for the same page file, writes it and its prediction, and
+  returns what it kept;
+- `recorded(run, page_id)` reads: what the run has recorded for the page, or None; and
 - `grade(run, dataset)` grades the pages recorded so far, writes `scores.jsonl` and `summary.json`, and
   returns the summary. A page with no record is pending, not failed; a run never prepared is refused.
 

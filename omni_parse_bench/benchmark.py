@@ -90,10 +90,10 @@ class Run(NamedTuple):
 
         prepare(run, dataset, timeout)                # once: the folder, and settings.json
         need = needs(run, page_id, want, sha)         # the outputs the page's record still lacks
-        store(run, page_id, harness.predict(...))     # the page's new record, merged and written
+        record(run, page_id, harness.predict(...))    # the page's new result, merged and written
         grade(run, dataset)                           # scores.jsonl and summary.json, as they stand
 
-    The record given to `store` carries `page_sha256`, the digest of the page file it was predicted
+    The record given to `record` carries `page_sha256`, the digest of the page file it was predicted
     from (`file_digest`)."""
 
     provider: str
@@ -122,8 +122,8 @@ def prepare(run: Run, dataset: str, timeout: float) -> None:
            gold=gold_revision(dataset, root), timeout_s=timeout)
 
 
-def record(run: Run, page_id: str) -> dict | None:
-    """The page's record in the run, or None when there is none (or it can't be read)."""
+def recorded(run: Run, page_id: str) -> dict | None:
+    """What the run has recorded for the page, or None when nothing (or nothing readable)."""
     return None if (got := read_record(run.records / f"{page_id}.json")) is None else got[0]
 
 
@@ -131,14 +131,14 @@ def needs(run: Run, page_id: str, want: frozenset[str], page_sha: str | None = N
           retry_failed: bool = False) -> frozenset[str]:
     """The outputs in `want` (what the page's tests read, `gold.wants`) the run still lacks for the
     page: `missing` over its record."""
-    return missing(record(run, page_id), want, retry_failed, page_sha)
+    return missing(recorded(run, page_id), want, retry_failed, page_sha)
 
 
-def store(run: Run, page_id: str, new: dict) -> dict:
+def record(run: Run, page_id: str, new: dict) -> dict:
     """A new record of the page made part of the run, and returned: merged into the old one when both
     are of the same page file (`merged`), else in its place; its outputs written to predictions/, then
     the record itself."""
-    old, sha = record(run, page_id), new.get("page_sha256")
+    old, sha = recorded(run, page_id), new.get("page_sha256")
     kept = merged(old, new) if old is not None and old.get("page_sha256", sha) == sha else new
     write_json(run.predictions / f"{page_id}.json", kept["outputs"])
     write_json(run.records / f"{page_id}.json", kept)
@@ -500,7 +500,7 @@ def predict_all(p: Plan) -> None:
 
     def one(r: Run, g: gold.Page, bar: progress.Reporter, halt: threading.Event) -> None:
         if stop.is_set() or halt.is_set(): return
-        want, old = gold.wants(tests[g.page_id]), record(r, g.page_id)
+        want, old = gold.wants(tests[g.page_id]), recorded(r, g.page_id)
         # Note: a record from before page digests is trusted, so resuming an old run fetches no page
         # only to check it.
         if old is not None and "page_sha256" not in old and not missing(old, want, p.retry_failed):
@@ -521,7 +521,7 @@ def predict_all(p: Plan) -> None:
         with bar.calling():
             new = harness.predict(r.provider, file, asked, timeout=p.timeout, **r.options)
         new["page_sha256"] = sha
-        store(r, g.page_id, new)
+        record(r, g.page_id, new)
         failed = any(why != "unsupported" for why in new["errors"].values())
         bar.record(error=failed, usd=sum(c["usd"] or 0 for c in new["calls"]),
                    wall_s=sum(c["wall_s"] for c in new["calls"]))
