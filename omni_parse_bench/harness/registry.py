@@ -18,7 +18,7 @@ from typing import Any
 from . import contract
 from .providers import (azure, chandra_ocr, datalab, deepseek_ocr, dots, extend, glm_ocr, hunyuan, infinity,
                         lighton, llamaparse, llm, mineru, mistral, nanonets, olmocr, paddleocr_vl, reducto,
-                        surya_ocr, tesseract, unlimited)
+                        surya_ocr, tesseract, unlimited, unstructured)
 
 DEFAULT_TIMEOUT = 900.0
 MODEL_SEPARATOR = "/"
@@ -30,6 +30,7 @@ ADAPTERS = {
     "llamaparse": llamaparse,
     "azure": azure,
     "mistral": mistral,
+    "unstructured": unstructured,
     "tesseract": tesseract,
     # Open models, each served from its folder in providers/oss/: the vendor's own code on a server of
     # ours, or vLLM alone where the vendor offers only the model.
