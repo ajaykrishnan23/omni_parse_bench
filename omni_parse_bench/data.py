@@ -57,6 +57,11 @@ class Page(NamedTuple):
     gt_path: str    # its tests: <dataset>/gold/<page_id>.json
     outputs: tuple[str, ...]    # what to predict: the output types its tests read (`gold.wants`), sorted
 
+    @property
+    def id(self) -> str:
+        """The page's id, by the name every benchmark's rows share (oeb's `Doc.id` is its doc_id)."""
+        return self.page_id
+
 
 def download_dataset(dataset: str | Path) -> Path:
     """A dataset as a local folder: a path as given, or a Hugging Face dataset downloaded whole, at one

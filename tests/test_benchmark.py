@@ -188,6 +188,7 @@ def test_a_loop_of_ones_own_keeps_a_run_through_its_functions(tmp_path, monkeypa
     settings = json.loads((r.out / "settings.json").read_text())
     assert settings["timeout_s"] == 900.0 and "gold" not in settings, "grade writes the gold it graded with"
     page = data.Page("p1", "d1", "suite", "pages/p1.pdf", "gold/p1.json", ("blocks", "html"))
+    assert page.id == page.page_id == "p1"
     want = frozenset(page.outputs)
     assert benchmark.needs(r, page) == want
     call = {"outputs": ["html", "blocks"], "usd": 0, "wall_s": 1.0,
