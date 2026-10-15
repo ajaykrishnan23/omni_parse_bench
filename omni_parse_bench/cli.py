@@ -26,7 +26,7 @@ from collections.abc import Sequence
 from pathlib import Path
 from typing import Any
 
-from omni_parse_bench import benchmark, progress, vocab
+from omni_parse_bench import benchmark, data, progress, vocab
 
 # command -> the extra it needs; `score` needs none.
 EXTRAS = {"predict": "harness", "providers": "harness", "reparse": "harness", "benchmark": "benchmark",
@@ -82,12 +82,9 @@ def cmd_score(a: argparse.Namespace) -> int:
 def cmd_tests(a: argparse.Namespace) -> int:
     """Every test of a dataset as a JSON line, with its page's id, suite and document: a flat table
     to query (polars, DuckDB, pandas), made from the gold files and never stored."""
-    from omni_parse_bench import gold
-
-    root = benchmark.dataset_root(a.dataset)
-    pages, _ = gold.load(root)   # Note: loaded first, so only a dataset that checks is written out.
+    pages, _ = data.check_dataset(a.dataset)   # Note: first, so only a dataset that checks is written out.
     for p in pages:
-        for t in json.loads((root / p.gt_path).read_text())["tests"]:
+        for t in json.loads(Path(p.gt_path).read_text())["tests"]:
             row = {"id": t["id"], "page_id": p.page_id, "suite": p.suite, "document": p.document} | t
             print(json.dumps(row, ensure_ascii=False))
     return 0
@@ -211,7 +208,8 @@ def cmd_grade(a: argparse.Namespace) -> int:
         said = {"unsupported": sorted(set(a.unsupported))}
         benchmark.write_json(path, (benchmark.read_json(path) or {}) | said)
     run = benchmark.Run((benchmark.read_json(path) or {}).get("provider", out.name), {}, out)
-    s = benchmark.grade(run, a.dataset, rescore=a.rescore, say=lambda m: print(m, file=sys.stderr))
+    _, pages = data.read_manifest(a.dataset)
+    s = benchmark.grade(run, pages, rescore=a.rescore, say=lambda m: print(m, file=sys.stderr))
     print(json.dumps({**{o: v["score"] for o, v in s.items() if isinstance(v, dict) and "score" in v},
                       "pages": s["pages"], "pages_pending": s["pages_pending"]}, indent=2))
     return 2 if benchmark.errors_in(s) else 0
@@ -222,7 +220,8 @@ def cmd_reparse(a: argparse.Namespace) -> int:
 
     Nothing is paid: a parsing fix reaches a finished run this way. With `--add`, outputs the run
     never asked for are read from its answers too, where they hold them (`harness.reparse`). The run's
-    scores are then out of date, so grade it again with `opb benchmark ... --score-only --rescore`.
+    scores are then out of date, and its next grading grades the changed pages again
+    (`opb benchmark ... --score-only`, or `opb grade`).
     """
     from omni_parse_bench import harness
 
@@ -262,7 +261,7 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     b = sub.add_parser("benchmark", help="predict and score every page, resumably")
     b.add_argument("--providers", nargs="+", required=True, metavar="NAME")
-    b.add_argument("--dataset", default=benchmark.DEFAULT_DATASET,
+    b.add_argument("--dataset", default=data.DEFAULT_DATASET,
                    help="a dataset folder, or hf://datasets/<repo>[@revision]")
     b.add_argument("--out", type=Path, default=Path("runs"), help="where run directories go")
     b.add_argument("--suites", nargs="+", help="limit to these suites")
@@ -277,7 +276,8 @@ def main(argv: Sequence[str] | None = None) -> int:
                    help="calls at once per adapter, shared by its runs: N for every adapter, or a number "
                         'per adapter, e.g. \'{"datalab": 20, "llm": 3}\' (llm: every OpenRouter model id; '
                         "default: a table per vendor)")
-    b.add_argument("--rescore", action="store_true", help="grade every page again, after a scorer change")
+    b.add_argument("--rescore", action="store_true", help="grade every page again (a changed gold or scorer "
+                   "grades its pages again without it)")
     b.add_argument("--score-only", action="store_true", help="grade what's recorded; predict nothing")
     b.add_argument("--retry-failed", action="store_true",
                    help="predict again outputs whose call may go otherwise: timeouts, outages, 429 and 5xx; "
@@ -286,15 +286,16 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     g = sub.add_parser("grade", help="grade a folder of predictions/<page_id>.json: yours, or a run's")
     g.add_argument("run", help="the folder holding predictions/ (and settings.json)")
-    g.add_argument("--dataset", default=benchmark.DEFAULT_DATASET,
+    g.add_argument("--dataset", default=data.DEFAULT_DATASET,
                    help="a dataset folder, or hf://datasets/<repo>[@revision]")
     g.add_argument("--unsupported", nargs="*", metavar="OUTPUT", choices=vocab.OUTPUT_TYPES,
                    help="output types your system can't produce, once for the folder (kept in its "
                         "settings.json); their tests are unsupported, not failed")
-    g.add_argument("--rescore", action="store_true", help="grade every page again, after a scorer change")
+    g.add_argument("--rescore", action="store_true", help="grade every page again (a changed gold or scorer "
+                   "grades its pages again without it)")
 
     tt = sub.add_parser("tests", help="every test as a JSON line, with its page's suite and document")
-    tt.add_argument("--dataset", default=benchmark.DEFAULT_DATASET,
+    tt.add_argument("--dataset", default=data.DEFAULT_DATASET,
                     help="a dataset folder, or hf://datasets/<repo>[@revision]")
 
     rp = sub.add_parser("reparse", help="read outputs again from saved answers, after a parsing fix")

@@ -205,7 +205,8 @@ and time) and the vendor's raw answers; [API.md](./API.md) shows one.
 
 ```python
 score(outputs, tests, unsupported=()) -> [Verdict(id, result, why)]
-summarize(verdicts, tests, pages=None) -> summary
+lines(verdicts, tests) -> [score line]   # each verdict beside what its test is
+summarize(lines, pages=None) -> summary  # over score lines: these, or a run's scores.jsonl
 ```
 
 A test's text and a provider's text view are compared after `fold` (normalize.py), the same function
@@ -301,7 +302,7 @@ omni_parse_bench/
   equations.py    equations compared by what KaTeX renders them to
   katex/          KaTeX (MIT), run in an embedded V8 (mini-racer)
   markdown.py     markdown → HTML, the one converter the harness runs on every provider's markdown
-  metric.py       score (one page's verdicts) and summarize (a run's scores)
+  scorer.py       score (one page's verdicts) and summarize (a run's scores)
   harness/        producing predictions:
     contract.py   the adapter protocol (Config, SUPPORTS, requests, call, parse) and Request/Call/Cost
     errors.py     how a call fails, and whether a retry can fix it
@@ -319,4 +320,4 @@ docs/
 ```
 
 Extras: the base install is the scorer; `[harness]` adds the adapters; `[benchmark]` adds Hugging
-Face, pyarrow (which `gold.load` needs) and the run orchestration.
+Face, pyarrow (which `data.read_manifest` needs) and the run orchestration.

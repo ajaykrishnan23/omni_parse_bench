@@ -2,7 +2,7 @@
 
     OPB_DATASET=~/parse_bench/dataset-v2 pytest tests/test_dataset.py
 
-`gold.load` already checks every manifest row and test, unique ids, stray gold files and every
+`data.check_dataset` already checks every manifest row and test, unique ids, stray gold files and every
 page's tests; this checks what only the folder can say: that it loads, and that pages/ holds each
 page's file and nothing else.
 """
@@ -13,16 +13,16 @@ from pathlib import Path
 
 import pytest
 
-from omni_parse_bench import gold
+from omni_parse_bench import data, gold
 
 ROOT = Path(os.environ.get("OPB_DATASET", "")).expanduser()
-pytestmark = pytest.mark.skipif(not (ROOT / gold.MANIFEST).exists(),
+pytestmark = pytest.mark.skipif(not (ROOT / data.MANIFEST).exists(),
                                 reason="set OPB_DATASET to a dataset root")
 
 
 @pytest.fixture(scope="module")
-def dataset() -> tuple[tuple[gold.Page, ...], tuple[gold.Test, ...]]:
-    return gold.load(ROOT)
+def dataset() -> tuple[tuple[data.Page, ...], tuple[gold.Test, ...]]:
+    return data.check_dataset(ROOT)
 
 
 def test_the_dataset_loads(dataset):

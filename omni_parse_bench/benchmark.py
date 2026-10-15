@@ -5,7 +5,7 @@
 
 Two levels of data, each a NamedTuple, and functions over them:
 
-    Plan   the invocation      every Run, and the pages (`gold.Page`) they cover; `plan(...)` builds it
+    Plan   the invocation      every Run, and the pages (`data.Page`) they cover; `plan(...)` builds it
     Run    one configuration   a provider plus its options, and the directory it writes to
 
 `execute(plan)` is `predict_all`, then `grade_all`. `describe(plan)` says what it would do, with
@@ -20,14 +20,15 @@ A run directory holds:
                                  cost, for an audit and for `opb reparse`; grading only sums the cost
     scores.jsonl                 one line per test: its verdict, what the test is (page, suite,
                                  document, type, tags, ...), and the stamps of what graded it
-    summary.json                 metric.summarize over every graded page, plus cost and coverage
+    summary.json                 scorer.summarize over every graded page, plus cost and coverage
 
 Resumable: a page is predicted again only for the outputs its record lacks, and graded again only
-when its lines are missing or its prediction changed. A folder of predictions/ made by anything (your
-own model) is graded the same way, with what it can't produce said in its settings.json (`opb grade`).
-A run never mixes datasets, golds or scorers: one graded with another gold or scorer is refused unless
---rescore. Concurrency is per adapter, not per run: every run of one adapter (two datalab modes, every
-OpenRouter model) shares one pool of `workers_for` its adapter. Credentials come from the environment
+when its lines are missing, or its prediction, its gold or the scoring code changed (`current`), so a
+run's scores are always this opb's against this dataset's gold, never a mix. A folder of predictions/
+made by anything (your own model) is graded the same way, with what it can't produce said in its
+settings.json (`opb grade`). A run never mixes datasets. Concurrency is per adapter, not per run:
+every run of one adapter (two datalab modes, every OpenRouter model) shares one pool of `workers_for`
+its adapter. Credentials come from the environment
 and everything else from `--options`.
 
     pip install 'omni-parse-bench[benchmark]'
@@ -43,12 +44,12 @@ import json
 import logging
 import os
 import threading
-import time
+import warnings
 from collections.abc import Callable, Mapping, Sequence
 from pathlib import Path
 from typing import Any, NamedTuple
 
-from omni_parse_bench import gold, metric, vocab
+from omni_parse_bench import data, gold, scorer, vocab
 
 # Note: calls in flight at one vendor, shared by every run of its adapter. A vendor's rate limit is
 # per account, so two datalab modes or ten OpenRouter models must not each get a full pool.
@@ -56,19 +57,16 @@ WORKERS = {"datalab": 10, "reducto": 3, "extend": 5, "llamaparse": 3, "azure": 3
            "tesseract": min(8, os.cpu_count() or 1)}
 DEFAULT_WORKERS = 5
 log = logging.getLogger(__name__)
-HF_PREFIX = "hf://datasets/"
-DEFAULT_DATASET = "hf://datasets/datalab-to/omni_parse_bench"
-DOWNLOAD_ATTEMPTS = 5
 
 
 # The code a verdict depends on: a change to any of it is a new scorer.
 SCORING = ("gold.py", "vocab.py", "runners.py", "views.py", "normalize.py", "tables.py", "equations.py",
-           "metric.py", "katex/katex.js")
+           "scorer.py", "katex/katex.js")
 
 
 def scorer_version() -> str:
-    """The package's version and a digest of its scoring code, stamped on each score line so a run
-    graded by another scorer is known (and refused without --rescore, `scoring`).
+    """The package's version and a digest of its scoring code, stamped on each score line so a line
+    graded by another scorer is known, and graded again (`current`, `scoring`).
 
     Note: the version alone is the same across every commit between releases, so it can't say the
     scoring changed; the digest of the files that decide a verdict can. The version is kept for the
@@ -79,7 +77,7 @@ def scorer_version() -> str:
     except importlib.metadata.PackageNotFoundError:
         version = "unknown"
     h = hashlib.sha256()
-    for name in SCORING: h.update((Path(metric.__file__).parent / name).read_bytes())
+    for name in SCORING: h.update((Path(scorer.__file__).parent / name).read_bytes())
     return f"{version}+{h.hexdigest()[:12]}"
 
 
@@ -101,7 +99,7 @@ class Run(NamedTuple):
         prepare(run, dataset, timeout)                # once: the folder, and settings.json
         need = needs(run, page)                       # the outputs the page's record still lacks
         record(run, page_id, harness.predict(...))    # the page's new result, merged and written
-        grade(run, dataset)                           # scores.jsonl and summary.json, as they stand
+        grade(run, pages)                             # scores.jsonl and summary.json, as they stand
 
     A run folder assumes its pages don't change under it: a dataset is pinned to a commit and its pages
     are never edited in place. Predicting again after a dataset's pages change is a new folder."""
@@ -127,14 +125,14 @@ def prepare(run: Run, dataset: str, timeout: float) -> None:
     from omni_parse_bench import harness
     from omni_parse_bench.harness import registry
 
-    root, _ = manifest(dataset)
+    root, _ = data.read_manifest(dataset)
     run.records.mkdir(parents=True, exist_ok=True)
     run.predictions.mkdir(exist_ok=True)
-    commit = {"commit": root.name} if str(dataset).startswith(HF_PREFIX) else {}
+    commit = {"commit": root.name} if str(dataset).startswith(data.HF_PREFIX) else {}
     path = run.out / "settings.json"
     write_json(path, (read_json(path) or {}) | {
         "run": run.out.name, "provider": run.provider,
-        "settings": harness.settings_for(run.provider, run.options), "dataset": dataset_id(dataset),
+        "settings": harness.settings_for(run.provider, run.options), "dataset": data.dataset_id(dataset),
         **commit, "timeout_s": timeout,
         "unsupported": sorted(set(vocab.OUTPUT_TYPES) - registry.adapter(run.provider).SUPPORTS)})
 
@@ -156,7 +154,7 @@ def predicted(run: Run, page_id: str) -> tuple[dict, str] | None:
                  f"a prediction (an object whose keys are among {list(vocab.OUTPUT_TYPES)})")
 
 
-def needs(run: Run, page: gold.Page, retry_failed: bool = False) -> frozenset[str]:
+def needs(run: Run, page: data.Page, retry_failed: bool = False) -> frozenset[str]:
     """The outputs the run still lacks for the page: of those the manifest says to predict for it
     (`page.outputs`), what its record doesn't settle (`missing`).
 
@@ -180,7 +178,7 @@ def record(run: Run, page_id: str, new: dict) -> dict:
 
 class Plan(NamedTuple):
     runs: tuple[Run, ...]
-    pages: tuple[gold.Page, ...]
+    pages: tuple[data.Page, ...]
     dataset: str
     timeout: float
     workers: int | Mapping[str, int]   # calls in flight: one number for every adapter, or per adapter
@@ -189,139 +187,19 @@ class Plan(NamedTuple):
     retry_failed: bool = False
 
 
-def dataset_root(dataset: str | Path) -> Path:
-    """A dataset as a local folder: a path as given, or a Hugging Face dataset downloaded.
-
-    Note: an `hf://datasets/<repo>` dataset fetches only its manifest and gold files here; each
-    page file is fetched when it's first read (`page_file`), so a `--limit` run downloads only its
-    pages.
-    """
-    if not str(dataset).startswith(HF_PREFIX):
-        root = Path(dataset).expanduser()
-        if not (root / gold.MANIFEST).exists():
-            raise FileNotFoundError(f"no {gold.MANIFEST} in {root}; pass --dataset a dataset folder "
-                                    f"or {HF_PREFIX}<repo>")
-        return root
-    from huggingface_hub import errors as hf_errors
-    from huggingface_hub import snapshot_download
-
-    repo, _, revision = str(dataset).removeprefix(HF_PREFIX).partition("@")
-    # Note: thousands of small files; the Hub drops some requests under that load, and a download
-    # picks up where the last left off, so it is simply tried again. A missing repo, revision or
-    # access is the same on every attempt, so it fails at once.
-    for attempt in range(DOWNLOAD_ATTEMPTS):
-        try:
-            return Path(snapshot_download(repo, repo_type="dataset", revision=revision or None,
-                                          allow_patterns=[gold.MANIFEST, "gold/*"], max_workers=4))
-        except (hf_errors.RepositoryNotFoundError, hf_errors.GatedRepoError,
-                hf_errors.RevisionNotFoundError) as exc:
-            raise ValueError(f"can't read dataset {dataset}: {type(exc).__name__}. Check the repo and "
-                             "revision, and that you're logged in with access (huggingface-cli login)"
-                             ) from None
-        except hf_errors.HfHubHTTPError as exc:
-            status = getattr(getattr(exc, "response", None), "status_code", None)
-            if status in (401, 403):
-                raise ValueError(f"can't read dataset {dataset}: HTTP {status}. Log in with access to it "
-                                 "(huggingface-cli login)") from None
-            if attempt == DOWNLOAD_ATTEMPTS - 1: raise
-        except Exception:
-            if attempt == DOWNLOAD_ATTEMPTS - 1: raise
-        time.sleep(30 * (attempt + 1))
-    raise AssertionError("unreachable")
-
-
-def dataset_id(dataset: str | Path) -> str:
-    """What a run's dataset is, whatever revision: the repo of an `hf://` dataset, or a folder's path."""
-    if str(dataset).startswith(HF_PREFIX): return str(dataset).partition("@")[0]
-    return str(Path(dataset).expanduser().resolve())
-
-
-@functools.cache
-def gold_revision(dataset: str) -> str:
-    """Which gold a run is graded against: a digest of what grading reads, each page's id, document and
-    suite (they decide the counts) and its gold file. So a dataset commit that changes nothing graded (a
-    card, a results table, the derived `outputs` column) is the same gold."""
-    root, ps = manifest(dataset)
-    h = hashlib.sha256()
-    for p in sorted(ps, key=lambda p: p.page_id):
-        h.update(json.dumps([p.page_id, p.document, p.suite]).encode())
-        h.update((root / p.gt_path).read_bytes())
+def gold_digest(page: data.Page) -> str:
+    """Which gold a page is graded against: a digest of what grading reads, its id, document and suite
+    (they decide the counts) and its gold file, stamped on each of its score lines. So a dataset commit
+    that changes nothing graded (a card, a results table, the derived `outputs` column) is the same gold."""
+    h = hashlib.sha256(json.dumps([page.page_id, page.document, page.suite]).encode())
+    h.update(Path(page.gt_path).read_bytes())
     return h.hexdigest()[:16]
 
 
-def graded_with(scores: dict[str, list[dict]]) -> frozenset[tuple[str | None, str | None]]:
-    """The (gold, scorer) pairs a run's score lines (`read_scores`) were graded with; none before its
-    first grading."""
-    return frozenset((x.get("gold"), x.get("scorer")) for xs in scores.values() for x in xs)
-
-
-def refuse_regrading(run: Run, revision: str, scores: dict[str, list[dict]]) -> None:
-    """Refuses a run whose score lines were graded with another gold or scoring code than this one
-    (`scoring`): grading it again would change its scores, which only `--rescore` does, every page at
-    once, never a mix."""
-    now = (revision, scoring(SCORER))
-    if stale := sorted(((g, s) for g, s in graded_with(scores) if (g, scoring(s)) != now), key=str):
-        was = ", ".join(f"gold {g} with scorer {s}" for g, s in stale)
-        raise ValueError(f"{run.out} was graded against {was}; this is gold {revision} with scorer "
-                         f"{SCORER}. Pass --rescore to grade every page again with these (no page is "
-                         "predicted again), or use the opb and dataset it was graded with")
-
-
 @functools.cache
-def manifest(dataset: str) -> tuple[Path, tuple[gold.Page, ...]]:
-    """The dataset's folder and its pages, each with what to predict for it, read once per process: from
-    the manifest alone (`gold.manifest`), so planning and predicting read no gold file."""
-    root = dataset_root(dataset)
-    return root, gold.manifest(root)
-
-
-@functools.cache
-def load(dataset: str) -> tuple[Path, tuple[gold.Page, ...], dict[str, tuple[gold.Test, ...]]]:
-    """The dataset's folder, its pages, and each page's tests by page id; read once per process."""
-    root, _ = manifest(dataset)
-    ps, ts = gold.load(root)
-    return root, ps, gold.by_page(ts)
-
-
-def page_file(dataset: str, root: Path, doc_path: str) -> Path:
-    """A page's file, fetched from Hugging Face the first time for an `hf://` dataset.
-
-    Note: fetched at the commit the gold was read at (`root.name`), not at the branch's head, so a
-    commit pushed mid-run can't pair one commit's page with another's gold."""
-    path = root / doc_path
-    if path.exists() or not str(dataset).startswith(HF_PREFIX): return path
-    from huggingface_hub import hf_hub_download
-
-    repo = str(dataset).removeprefix(HF_PREFIX).partition("@")[0]
-    return Path(hf_hub_download(repo, doc_path, repo_type="dataset", revision=root.name))
-
-
-def pages(dataset: str, suites: list[str] | None = None, limit: int = 0,
-          sample: int = 0, only: frozenset[str] | None = None) -> tuple[gold.Page, ...]:
-    """The dataset's pages, in manifest order, filtered by suite and by `only` (page ids, each of which
-    must be in the dataset), and limited.
-
-    `sample` picks that many pages spread over every suite: suites in turn, each page evenly spaced
-    within its suite, so a smoke test sees every kind of page and the same pages each time."""
-    _, rows = manifest(str(dataset))
-    known = {r.suite for r in rows}
-    if bad := sorted(set(suites or ()) - known):
-        raise ValueError(f"unknown suites {bad}; the dataset's suites are {sorted(known)}")
-    rows = tuple(r for r in rows if not suites or r.suite in suites)
-    if only is not None:
-        if bad := sorted(only - {r.page_id for r in rows}):
-            raise ValueError(f"{len(bad)} of the pages asked for aren't in the dataset"
-                             f"{' (or its suites)' if suites else ''}, e.g. {bad[:3]}; nothing has been run")
-        rows = tuple(r for r in rows if r.page_id in only)
-    if sample:
-        by: dict[str, list] = {}
-        for r in rows: by.setdefault(r.suite, []).append(r)
-        k = -(-sample // len(by))
-        spread = [[xs[i * len(xs) // min(k, len(xs))] for i in range(min(k, len(xs)))] for xs in by.values()]
-        turns = [x for i in range(k) for xs in spread if i < len(xs) for x in [xs[i]]]
-        chosen = {r.page_id for r in turns[:sample]}
-        rows = tuple(r for r in rows if r.page_id in chosen)
-    return rows[:limit] if limit else rows
+def tests(page: data.Page) -> tuple[gold.Test, ...]:
+    """The page's tests (`scorer.gold`), read once per process."""
+    return scorer.gold(page)
 
 
 def configurations(providers: list[str], options: dict | None = None) -> list[tuple[str, dict]]:
@@ -339,7 +217,7 @@ def configurations(providers: list[str], options: dict | None = None) -> list[tu
     return out
 
 
-def plan(providers: list[str], *, out: str | Path = Path("runs"), dataset: str = DEFAULT_DATASET,
+def plan(providers: list[str], *, out: str | Path = Path("runs"), dataset: str = data.DEFAULT_DATASET,
          suites: list[str] | None = None, limit: int = 0, sample: int = 0, options: dict | None = None,
          timeout: float = 0, workers: int = 0, rescore: bool = False,
          score_only: bool = False, retry_failed: bool = False, only: frozenset[str] | None = None) -> Plan:
@@ -359,15 +237,12 @@ def plan(providers: list[str], *, out: str | Path = Path("runs"), dataset: str =
         raise ValueError(f"run {twice[0]} is asked for more than once: the same provider with the same "
                          "settings (an option set to its default is the same setting); drop the repeat from "
                          "--providers or --options")
-    ps = pages(dataset, suites, limit, sample, only)
-    ident = dataset_id(dataset)
+    ps = data.select(data.read_manifest(dataset)[1], suites, limit, sample, only)
+    ident = data.dataset_id(dataset)
     for r in runs:
         if (was := (read_json(r.out / "settings.json") or {}).get("dataset", ident)) != ident:
             raise ValueError(f"{r.out} is a run on dataset {was}, not {ident}, and a run never mixes "
                              f"datasets; pass another --out, or --dataset {was}")
-    # Note: refused here, before any call, not after hours of predictions; grade checks again.
-    if not rescore and any((r.out / "scores.jsonl").exists() for r in runs):
-        for r in runs: refuse_regrading(r, gold_revision(str(dataset)), read_scores(r.out / "scores.jsonl"))
     return Plan(runs, ps, str(dataset), timeout or harness.DEFAULT_TIMEOUT, workers, rescore, score_only,
                 retry_failed)
 
@@ -402,14 +277,13 @@ def per_adapter(workers: Mapping[str, int]) -> dict[str, int]:
 def owed(p: Plan, r: Run) -> tuple[int, int]:
     """How many of the plan's pages this run will predict, and grade, by the rules `predict_all` and
     `grade_all` follow."""
-    _, _, tests = load(p.dataset)
     rows = {} if p.rescore else read_scores(r.out / "scores.jsonl")
     predict = grade = 0
     for g in p.pages:
         coming = not p.score_only and bool(needs(r, g, p.retry_failed))
         got = predicted(r, g.page_id)
         predict += coming
-        grade += coming or (got is not None and not current(rows.get(g.page_id), got[1], tests[g.page_id]))
+        grade += coming or (got is not None and not current(rows.get(g.page_id), got[1], g, tests(g)))
     return predict, grade
 
 
@@ -501,7 +375,6 @@ def predict_all(p: Plan) -> None:
     one pool (`workers_for`), the adapters go at once, and a live table shows each run (`progress.py`)."""
     from omni_parse_bench import harness, progress
 
-    root, _ = manifest(p.dataset)
     # Note: set on an interrupt, so no run starts another page; a call already made is let finish.
     stop = threading.Event()
     by: dict[str, list[Run]] = {}
@@ -509,17 +382,15 @@ def predict_all(p: Plan) -> None:
         prepare(r, p.dataset, p.timeout)
         by.setdefault(harness.resolve(r.provider), []).append(r)
 
-    def one(r: Run, g: gold.Page, bar: progress.Reporter, halt: threading.Event) -> None:
+    def one(r: Run, g: data.Page, bar: progress.Reporter, halt: threading.Event) -> None:
         if stop.is_set() or halt.is_set(): return
         if not (asked := needs(r, g, p.retry_failed)):
             bar.kept()
             return
-        try:
-            file = page_file(p.dataset, root, g.doc_path)
-        except Exception as exc:  # noqa: BLE001
-            # Note: a page whose file can't be had isn't the vendor's failure: nothing is
-            # recorded, so it is neither graded nor held against it, and a resume tries again.
-            log.warning("%s: no page file for %s: %s", r.out.name, g.page_id, str(exc)[:200])
+        if not (file := Path(g.doc_path)).exists():
+            # Note: a page whose file is missing isn't the vendor's failure: nothing is recorded, so
+            # it is neither graded nor held against it, and a resume tries again.
+            log.warning("%s: no page file for %s at %s", r.out.name, g.page_id, file)
             bar.record(error=True, usd=0, wall_s=0)
             return
         with bar.calling():
@@ -612,27 +483,26 @@ def digest(text: str) -> str:
     return hashlib.sha256(text.encode()).hexdigest()[:16]
 
 
-def current(lines: Sequence[dict] | None, prediction: str, tests: Sequence[gold.Test]) -> bool:
+def current(lines: Sequence[dict] | None, prediction: str, page: data.Page, ts: Sequence[gold.Test]) -> bool:
     """Whether a page's score lines still stand: they grade the prediction whose digest is `prediction`,
-    one line for each of the page's tests (a line lost is graded again). Their gold and scorer are the
-    run's, which `refuse_regrading` makes sure of before any page is graded."""
+    against the page's gold as it is (`gold_digest`), with this scoring code (`scoring`), one line for each
+    of its tests `ts` (a line lost is graded again). A changed gold or scorer grades the page again, which
+    calls no provider."""
     if not lines: return False
-    return (all(x.get("prediction") == prediction for x in lines)
-            and sorted(x["test_id"] for x in lines) == sorted(t.id for t in tests))
+    now = (prediction, gold_digest(page), scoring(SCORER))
+    return (all((x.get("prediction"), x.get("gold"), scoring(x.get("scorer"))) == now for x in lines)
+            and sorted(x["test_id"] for x in lines) == sorted(t.id for t in ts))
 
 
-def grade_page(r: Run, outputs: dict, prediction: str, page: gold.Page, tests: Sequence[gold.Test],
-               revision: str, cannot: frozenset[str]) -> list[dict]:
-    """One page's score lines, one per test: the verdict beside what its test is, so a run's scores
-    are a table to query as they stand, stamped with what they grade and what graded them. `cannot`
-    is what the run's system can't produce (`unsupported`)."""
-    vs = metric.score(outputs, tests, cannot)
-    return [{"run": r.out.name, "provider": r.provider, "page_id": page.page_id, "suite": page.suite,
-             "document": page.document, "test_id": t.id, "test_type": t.test_type,
-             "output_type": t.output_type, "derivation": t.derivation, "tags": list(t.tags),
-             "result": v.result, "why": v.why,
-             "prediction": prediction, "gold": revision, "scorer": SCORER}
-            for t, v in zip(tests, vs, strict=True)]
+def grade_page(r: Run, outputs: dict, prediction: str, page: data.Page, ts: Sequence[gold.Test],
+               cannot: frozenset[str]) -> list[dict]:
+    """One page's score lines (`scorer.lines`), one per test: the verdict beside what its test is, so a
+    run's scores are a table to query as they stand, stamped with what they grade and what graded them.
+    `cannot` is what the run's system can't produce (`unsupported`)."""
+    head = {"run": r.out.name, "provider": r.provider, "page_id": page.page_id, "suite": page.suite,
+            "document": page.document}
+    stamps = {"prediction": prediction, "gold": gold_digest(page), "scorer": SCORER}
+    return [head | x | stamps for x in scorer.lines(scorer.score(outputs, ts, cannot), ts)]
 
 
 def errors_in(summary: dict) -> int:
@@ -650,16 +520,20 @@ def headline(name: str, summary: dict) -> str:
             f"{summary['pages_pending']} pending" + (f"; {errs} tests errored in our code" if errs else ""))
 
 
-def grade(run: Run, dataset: str, rescore: bool = False, say: Callable[[str], None] = print) -> dict:
-    """Grade every predicted page of the run and write its scores and summary; returns the summary.
+def grade(run: Run, pages: Sequence[data.Page], rescore: bool = False, say: Callable[[str], None] = print
+          ) -> dict:
+    """Grade every page of `pages` the run has a prediction for, and write its scores and summary; returns
+    the summary. `pages` is usually the whole dataset (`data.read_manifest(dataset)`), as `grade_all`
+    passes it.
 
-    Grading reads predictions/ alone, and the run's `unsupported`; records add only their cost to the
-    summary, so a folder of predictions made by anything is graded the same way. It covers every page
-    of the dataset the run has a prediction for, whatever `--suites` and `--limit` chose to predict, so
-    a smaller invocation never shrinks a run's scores; a page with no prediction is pending, not failed.
-    A page's lines are graded again when they aren't `current`: its prediction or the page's tests have
-    changed. A run graded with another gold or scorer is refused (`refuse_regrading`) unless `rescore`,
-    which grades every page again; each line and summary.json say which gold and scorer graded them.
+    Grading reads predictions/ alone, the run's `unsupported` and each page's gold file (`gt_path`);
+    records add only their cost to the summary, so a folder of predictions made by anything is graded the
+    same way. Given the whole dataset, it covers every page the run has a prediction for, whatever
+    `--suites` and `--limit` chose to predict, so a smaller invocation never shrinks a run's scores; a page
+    with no prediction is pending, not failed.
+    A page's lines are graded again when they aren't `current`: its prediction, its gold or the scoring
+    code changed. `rescore` grades every page again. Each line says which prediction, gold and scorer
+    graded it, and summary.json which scorer.
     Scores are written however grading ends, so an interrupt keeps what was graded. A run that was never
     prepared is refused: its folder is most likely another one (another option, another --out)."""
     if not run.predictions.is_dir():
@@ -667,32 +541,27 @@ def grade(run: Run, dataset: str, rescore: bool = False, say: Callable[[str], No
                          "was never prepared there (it has no predictions/). Check --out and --options, or "
                          "prepare it first")
     cannot = unsupported(run)
-    root, every, tests = load(dataset)
-    revision = gold_revision(dataset)
     path = run.out / "scores.jsonl"
     old = {} if rescore else read_scores(path)
-    refuse_regrading(run, revision, old)
     lines_of, seen, calls = {}, set(), []
     try:
-        for g in every:
+        for g in pages:
             if (got := predicted(run, g.page_id)) is not None:
                 outputs, text = got
                 if (rec := recorded(run, g.page_id)) is not None: calls += rec["calls"]
-                had, ts = old.get(g.page_id), tests[g.page_id]
-                lines_of[g.page_id] = had if current(had, text, ts) else grade_page(
-                    run, outputs, text, g, ts, revision, cannot)
+                had, ts = old.get(g.page_id), tests(g)
+                lines_of[g.page_id] = had if current(had, text, g, ts) else grade_page(
+                    run, outputs, text, g, ts, cannot)
             seen.add(g.page_id)
     finally:
         # Note: a page not reached yet keeps its old lines, which their stamps let the next grading check.
-        kept = [lines_of.get(g.page_id) if g.page_id in seen else old.get(g.page_id) for g in every]
+        kept = [lines_of.get(g.page_id) if g.page_id in seen else old.get(g.page_id) for g in pages]
         lines = [x for xs in kept for x in xs or ()]
         write_text(path, "".join(json.dumps(x, ensure_ascii=False) + "\n" for x in lines))
-    ordered = [lines_of[g.page_id] for g in every if g.page_id in lines_of]
-    by_id = {t.id: t for g in every if g.page_id in lines_of for t in tests[g.page_id]}
-    verdicts = [metric.Verdict(x["test_id"], x["result"], x["why"]) for xs in ordered for x in xs]
-    summary = metric.summarize(verdicts, [by_id[v.id] for v in verdicts], every)
-    summary |= {"gold": revision, "scorer": SCORER, "pages": len(ordered),
-                "pages_pending": len(every) - len(ordered),
+    graded = [g for g in pages if g.page_id in lines_of]
+    summary = scorer.summarize([x for g in graded for x in lines_of[g.page_id]], pages)
+    summary |= {"scorer": SCORER, "pages": len(graded),
+                "pages_pending": len(pages) - len(graded),
                 "usd": round(sum(c.get("usd") or 0 for c in calls), 4),
                 "credits": round(sum(c.get("credits") or 0 for c in calls), 4)}
     write_json(run.out / "summary.json", summary)
@@ -702,7 +571,8 @@ def grade(run: Run, dataset: str, rescore: bool = False, say: Callable[[str], No
 
 def grade_all(p: Plan, say: Callable[[str], None] = print) -> dict[str, dict]:
     """`grade` each run of the plan; their summaries by run name."""
-    return {r.out.name: grade(r, p.dataset, p.rescore, say) for r in p.runs}
+    _, every = data.read_manifest(p.dataset)
+    return {r.out.name: grade(r, every, p.rescore, say) for r in p.runs}
 
 
 def execute(p: Plan, say: Callable[[str], None] = print) -> dict[str, dict]:
@@ -712,3 +582,58 @@ def execute(p: Plan, say: Callable[[str], None] = print) -> dict[str, dict]:
     finally:
         summaries = grade_all(p, say)
     return summaries
+
+
+# Note: the names that moved to `data`, kept for one release. Each warns, naming its replacement.
+MOVED = {"HF_PREFIX": "data.HF_PREFIX", "DEFAULT_DATASET": "data.DEFAULT_DATASET",
+         "DOWNLOAD_ATTEMPTS": "data.DOWNLOAD_ATTEMPTS"}
+
+
+def __getattr__(name: str) -> Any:
+    if name not in MOVED: raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+    _deprecated(f"benchmark.{name}", MOVED[name])
+    return getattr(data, MOVED[name].removeprefix("data."))
+
+
+def dataset_root(dataset: str | Path) -> Path:
+    """Deprecated: `data.download_dataset(dataset)`."""
+    _deprecated("benchmark.dataset_root(dataset)", "data.download_dataset(dataset)")
+    return data.download_dataset(dataset)
+
+
+def dataset_id(dataset: str | Path) -> str:
+    """Deprecated: `data.dataset_id(dataset)`."""
+    _deprecated("benchmark.dataset_id(dataset)", "data.dataset_id(dataset)")
+    return data.dataset_id(dataset)
+
+
+def manifest(dataset: str) -> tuple[Path, tuple[data.Page, ...]]:
+    """Deprecated: `data.read_manifest(dataset)`."""
+    _deprecated("benchmark.manifest(dataset)", "data.read_manifest(dataset)")
+    return data.read_manifest(dataset)
+
+
+def pages(dataset: str, suites: list[str] | None = None, limit: int = 0,
+          sample: int = 0, only: frozenset[str] | None = None) -> tuple[data.Page, ...]:
+    """Deprecated: `data.select(data.read_manifest(dataset)[1], ...)`."""
+    _deprecated("benchmark.pages(dataset, ...)", "data.select(data.read_manifest(dataset)[1], ...)")
+    return data.select(data.read_manifest(dataset)[1], suites, limit, sample, only)
+
+
+def page_file(dataset: str, root: Path, doc_path: str) -> Path:
+    """Deprecated: `page.doc_path`, a full local path once `data.read_manifest` has read it."""
+    _deprecated("benchmark.page_file(dataset, root, doc_path)", "page.doc_path")
+    return Path(root) / doc_path
+
+
+def load(dataset: str) -> tuple[Path, tuple[data.Page, ...], dict[str, tuple[gold.Test, ...]]]:
+    """Deprecated: `data.check_dataset(dataset)`, which returns the pages and the tests."""
+    _deprecated("benchmark.load(dataset)", "data.check_dataset(dataset)")
+    root, _ = data.read_manifest(dataset)
+    ps, ts = data.check_dataset(dataset)
+    return root, ps, gold.by_page(ts)
+
+
+def _deprecated(old: str, new: str) -> None:
+    warnings.warn(f"{old} is deprecated: use {new}. The old name will be removed in a later release.",
+                  DeprecationWarning, stacklevel=3)

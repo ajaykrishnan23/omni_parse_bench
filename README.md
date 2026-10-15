@@ -80,7 +80,7 @@ Here is one page with three tests. It is written inline with `gold.parse` so the
 file's shape is visible:
 
 ```python
-from omni_parse_bench import gold, score, summarize
+from omni_parse_bench import gold, lines, score, summarize
 
 tests = gold.parse("example-p1", {"tests": [
     {
@@ -138,7 +138,7 @@ verdicts = score(outputs, tests)
  Verdict(id='t2', result='pass', why=''),
  Verdict(id='t3', result='fail', why="no cell matching '4.2' in any table")]
 
->>> s = summarize(verdicts, tests)["html"]
+>>> s = summarize(lines(verdicts, tests))["html"]
 >>> s["score"], s["per_test_type"], s["per_tag"]["table"]
 (0.6666666666666666, {'present': 1.0, 'order': 1.0, 'table_cell': 0.0}, {'score': 0.0, 'tests': 1, 'pages': 1})
 ```
